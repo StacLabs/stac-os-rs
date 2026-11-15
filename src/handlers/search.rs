@@ -44,6 +44,10 @@ async fn run_scoped_search(
         }
     }
 
+    // `filter-crs` on GET params and POST bodies — only CRS84 is
+    // supported; OGC Features Part 3 requires a 400 otherwise.
+    check_filter_crs(search.items.filter_crs.as_deref())?;
+
     // `validate_bbox`: every latitude in [-90, 90], longitude in
     // [-180, 180] — before antimeridian rewriting so `[100,0,0,105]`
     // is a 400, not a wrap.

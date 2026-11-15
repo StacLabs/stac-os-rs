@@ -334,6 +334,68 @@ async fn test_search_bbox_datetime_intersects_ids() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
+/// `filter-crs` accepts only CRS84 — anything else is a 400 on every
+/// surface that takes the param (OGC Features Part 3).
+#[tokio::test]
+async fn test_filter_crs_validation() {
+    let Some(state) = test_state(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let app = build_app(state);
+    let cat = uniq("it-crs-cat");
+    let col = uniq("it-crs-col");
+
+    let (s, _) = call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let crs84 = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+    let ok = [
+        format!("/search?filter-crs={crs84}"),
+        format!("/catalogs/{cat}/search?filter-crs={crs84}"),
+        format!("/collections/{col}/items?filter-crs={crs84}"),
+        format!("/catalogs/{cat}/collections/{col}/items?filter-crs={crs84}"),
+    ];
+    for path in ok {
+        let (s, _) = call(&app, "GET", &path, None).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+    }
+    let bad = [
+        format!("/search?filter-crs=EPSG:4326"),
+        format!("/catalogs/{cat}/search?filter-crs=EPSG:4326"),
+        format!("/collections/{col}/items?filter-crs=EPSG:4326"),
+        format!("/catalogs/{cat}/collections/{col}/items?filter-crs=EPSG:4326"),
+    ];
+    for path in bad {
+        let (s, _) = call(&app, "GET", &path, None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{path}");
+    }
+    // POST bodies carry the same member.
+    for body in [
+        json!({"filter-crs": crs84}),
+        json!({"filter-crs": "EPSG:4326"}),
+    ] {
+        let (s, _) = call(&app, "POST", "/search", Some(body.clone())).await;
+        assert_eq!(
+            s,
+            if body["filter-crs"] == crs84 {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_search_pagination() {
     let Some(state) = test_state(true).await else {

@@ -236,8 +236,22 @@ pub struct ListQuery {
     pub filter: Option<String>,
     #[serde(rename = "filter-lang")]
     pub filter_lang: Option<String>,
+    #[serde(rename = "filter-crs")]
+    pub filter_crs: Option<String>,
     pub bbox: Option<String>,
     pub datetime: Option<String>,
+}
+
+/// `filter-crs` declares the CRS of spatial literals in `filter`. Only
+/// CRS84 is supported — OGC Features Part 3 requires a 400 for anything
+/// else (upstream declares the param but never validates it).
+pub(crate) fn check_filter_crs(raw: Option<&str>) -> Result<(), ApiError> {
+    match raw {
+        None | Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84") => Ok(()),
+        Some(_) => Err(ApiError::BadRequest(
+            "Invalid parameters provided: filter-crs".to_string(),
+        )),
+    }
 }
 
 /// 400 for a CQL2 translation error. Upstream surfaces `to_es`
