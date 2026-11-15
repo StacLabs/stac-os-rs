@@ -10,12 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `FREE_TEXT_FIELDS` env var (upstream parity): comma-separated
-  `multi_match` field list for item-search `q`, boost syntax allowed.
-  When unset, `q` now uses upstream's default fields — `id`,
+  `multi_match` field list for item free-text `q`, boost syntax
+  allowed. When unset, `q` now uses upstream's default fields — `id`,
   `collection`, `properties.title^3`, `properties.description`,
   `properties.keywords` — instead of the previous broader
   `id, collection, properties.*` (behavior change: terms in arbitrary
   custom properties no longer match unless the field is listed)
+
+### Fixed
+
+- `q` on the item listings (`GET /collections/{id}/items` and the
+  scoped `/catalogs/{id}/collections/{id}/items`) — the param was
+  declared on `ListQuery` but silently dropped;
+  `v1.0.0-rc.1/ogcapi-features#free-text` is now advertised
+- Item-listing `next` links now echo all request params (upstream
+  `_next_query`), not just `filter`/`filter-lang` — `q`, `bbox`,
+  `datetime`, `ids`, `sortby`, `fields`, and `query` were previously
+  dropped from page 2 onward
 
 ## [0.8.1] - 2026-11-15
 

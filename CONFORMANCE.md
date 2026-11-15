@@ -58,7 +58,7 @@ Legend:
 | Default limit 10 (`STAC_DEFAULT_ITEM_LIMIT`), cap `MAX_SEARCH_LIMIT` | ✅ | |
 | Response is an ItemCollection with `numberMatched`/`numberReturned` | ✅ | Top-level fields are the current (non-deprecated) form |
 | `next`/`prev` pagination links (GET href-merge; POST body+token) | ✅ | Opaque `token` cursor |
-| `q` free-text parameter | ✅ | Comma-separated terms OR'd via a lenient `multi_match` (`best_fields`, `fuzziness=AUTO`) over `id`/`collection`/`properties.*`; `v1.0.0-rc.1/item-search#free-text` advertised |
+| `q` free-text parameter | ✅ | Comma-separated terms OR'd via a lenient `multi_match` (`best_fields`, `fuzziness=AUTO`) over `FREE_TEXT_FIELDS` (upstream defaults); applies to `/search` and the `/collections/{id}/items` listings — `v1.0.0-rc.1/item-search#free-text` and `v1.0.0-rc.1/ogcapi-features#free-text` advertised |
 
 ## Filter / CQL2 (`item-search#filter`, `features-3` + `cql2` classes)
 

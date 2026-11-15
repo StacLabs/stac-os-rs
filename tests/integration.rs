@@ -475,6 +475,85 @@ async fn test_free_text_fields() {
     assert_eq!(body["numberMatched"], 1);
 }
 
+/// `q` on the items listings (features binding) — same `FREE_TEXT_FIELDS`
+/// clause as item search, and the `next` link echoes all params forward.
+#[tokio::test]
+async fn test_items_listing_q() {
+    use stac_os_rs::store::{NodeKind, COLLECTIONS_INDEX, ITEMS_INDEX, ROOT_CATALOG_ID};
+
+    let Some((app, state)) = test_app(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let col = uniq("ftq-col");
+    let mut a = common::item(&uniq("ftq-a"), &col);
+    a["properties"]["title"] = json!("Alpine Meadow");
+    let mut b = common::item(&uniq("ftq-b"), &col);
+    b["properties"]["title"] = json!("Alpine Ridge");
+    let mut c = common::item(&uniq("ftq-c"), &col);
+    c["properties"]["title"] = json!("Desert Dune");
+    state
+        .store
+        .index_document(COLLECTIONS_INDEX, &col, collection(&col))
+        .await
+        .unwrap();
+    state
+        .store
+        .set_parents(
+            &col,
+            vec![ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+    for it in [a, b, c] {
+        let key = format!("{}|{col}", it["id"].as_str().unwrap());
+        state
+            .store
+            .index_document(ITEMS_INDEX, &key, it)
+            .await
+            .unwrap();
+    }
+
+    // `q` filters the global listing; a non-matching term empties it.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?q=alpine"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 2);
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?q=zebra"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 0);
+
+    // `q` (and every other param) survives pagination via the raw-query echo.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?q=alpine&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let next = body["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .expect("next link");
+    let href = next["href"].as_str().unwrap();
+    assert!(href.contains("q=alpine"), "{href}");
+}
+
 #[tokio::test]
 async fn test_search_pagination() {
     let Some(state) = test_state(true).await else {
