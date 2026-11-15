@@ -107,6 +107,31 @@ async fn test_create_catalog() {
     assert_eq!(body["title"], "Test Catalog");
 }
 
+/// Reserved ids are rejected on every create/link path: `search`
+/// collides with the static `/catalogs/search` route and `root` is
+/// the implicit root node — docs under those ids would be unreachable.
+#[tokio::test]
+async fn test_reserved_catalog_ids() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let cat = uniq("cat-reserved");
+    let (s, _) = post_catalog(&app, &cat).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    for id in ["search", "root"] {
+        let (s, _) = post_catalog(&app, id).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "POST /catalogs id={id}");
+        // Mode A: full-body create under a parent
+        let (s, _) = post_sub_catalog(&app, &cat, catalog(id)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "Mode A id={id}");
+        // Mode B: link-by-id — the reserved check precedes the 404
+        // on a missing target.
+        let (s, _) = post_sub_catalog(&app, &cat, json!({"id": id})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "Mode B id={id}");
+    }
+}
+
 #[tokio::test]
 async fn test_update_catalog() {
     let Some((app, _)) = test_app(true).await else {

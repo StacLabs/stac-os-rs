@@ -13,6 +13,21 @@ use stac::Catalog;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Ids a catalog can never be created or linked under: `search`
+/// collides with the static `/catalogs/search` route (a doc there is
+/// unreachable), and `root` is the implicit root node's id.
+const RESERVED_CATALOG_IDS: &[&str] = &["search", "root"];
+
+fn check_catalog_id(id: &str) -> Result<(), ApiError> {
+    if RESERVED_CATALOG_IDS.contains(&id) {
+        Err(ApiError::BadRequest(format!(
+            "Invalid catalog id '{id}': reserved"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/catalogs",
@@ -111,6 +126,7 @@ pub async fn create_root_catalog(
     // Top-level creates are always root-level — a client-supplied
     // `parent_ids` is ignored (the hierarchy index is authoritative).
     catalog.additional_fields.remove("parent_ids");
+    check_catalog_id(&catalog.id)?;
     // 409 on collision with an existing catalog OR collection id
     for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
         if state
@@ -588,6 +604,7 @@ pub async fn link_or_create_sub_catalog(
     require_catalog(&state, &catalog_id).await?;
     match payload {
         CreateOrLinkPayload::LinkReference { id } => {
+            check_catalog_id(&id)?;
             // Mode B: link must target an existing catalog — 404 otherwise
             if state
                 .store
@@ -626,6 +643,7 @@ pub async fn link_or_create_sub_catalog(
             filter_stored_catalog_links(&mut new_catalog.links, &state.base_url);
             // The path parent is the edge — body `parent_ids` is ignored.
             new_catalog.additional_fields.remove("parent_ids");
+            check_catalog_id(&new_catalog.id)?;
             // Mode A: full-body repost of an existing id is a conflict
             for index in [CATALOGS_INDEX, COLLECTIONS_INDEX] {
                 if state

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything else returns 400 on `/search`, `/catalogs/**/search`, and
   both items listings (OGC Features Part 3; upstream declares the
   param but never validates it). It was previously silently ignored
+- Reserved catalog ids are rejected with 400 on create and
+  link-by-id: `search` (collides with the static `/catalogs/search`
+  route — the doc would be unreachable) and `root` (the implicit
+  root node's id)
 - CONFORMANCE.md no longer lists `startsWith`/`endsWith` under the
   `item-search#query` operators — they return 400 (unimplemented
   upstream too, where they're commented out of the `Operator` enum)
