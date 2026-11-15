@@ -101,6 +101,10 @@ pub struct AppState {
     /// failures than this aborts the batch unconditionally
     /// ("Validation error threshold exceeded"). None = no cutoff.
     pub max_batch_error_size: Option<usize>,
+    /// `FREE_TEXT_FIELDS` — `multi_match` field list for item-search
+    /// `q` (boost syntax like `properties.title^3` allowed). Unset or
+    /// empty falls back to [`default_free_text_fields`].
+    pub free_text_fields: Vec<String>,
 }
 
 impl AppState {
@@ -134,6 +138,22 @@ pub(crate) async fn validate_stac_doc(
         Ok(Err(e)) => Err(validation_error(e)),
         Ok(Ok(_)) => Ok(()),
     }
+}
+
+/// `FREE_TEXT_FIELDS` default — upstream's curated `multi_match` field
+/// list for item-search `q` (`title^3` is a field boost). Custom
+/// properties are searched by listing them in the env var.
+pub fn default_free_text_fields() -> Vec<String> {
+    [
+        "id",
+        "collection",
+        "properties.title^3",
+        "properties.description",
+        "properties.keywords",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// `VALIDATOR_POOL_SIZE` default — max in-flight batch-member

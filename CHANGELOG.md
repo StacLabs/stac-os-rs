@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FREE_TEXT_FIELDS` env var (upstream parity): comma-separated
+  `multi_match` field list for item-search `q`, boost syntax allowed.
+  When unset, `q` now uses upstream's default fields — `id`,
+  `collection`, `properties.title^3`, `properties.description`,
+  `properties.keywords` — instead of the previous broader
+  `id, collection, properties.*` (behavior change: terms in arbitrary
+  custom properties no longer match unless the field is listed)
+
 ## [0.8.1] - 2026-11-15
 
 ### Fixed

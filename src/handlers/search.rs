@@ -266,14 +266,14 @@ async fn run_scoped_search(
         extra_filters.push(crate::store::cql2_clause(filter).map_err(bad_filter)?);
     }
     // `multi_match` + `lenient` (upstream `apply_free_text_filter`):
-    // `properties.*` expands to dates and numerics too — lenient skips
-    // fields a term can't parse instead of failing the whole query,
-    // and avoids `simple_query_string`'s operator syntax mangling
-    // hyphenated terms like `sentinel-2`.
+    // lenient skips fields a term can't parse instead of failing the
+    // whole query, and avoids `simple_query_string`'s operator syntax
+    // mangling hyphenated terms like `sentinel-2`. Field list is
+    // `FREE_TEXT_FIELDS` (upstream defaults via AppState).
     if !q_terms.is_empty() {
         extra_filters.push(json!({"multi_match": {
             "query": q_terms.join(" "),
-            "fields": ["id", "collection", "properties.*"],
+            "fields": &state.free_text_fields,
             "type": "best_fields",
             "fuzziness": "AUTO",
             "lenient": true,

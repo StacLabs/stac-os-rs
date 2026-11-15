@@ -396,6 +396,85 @@ async fn test_filter_crs_validation() {
     }
 }
 
+/// `FREE_TEXT_FIELDS` — item-search `q` runs `multi_match` over the
+/// configured field list. Upstream defaults (id, collection,
+/// title^3, description, keywords) miss custom props until listed.
+#[tokio::test]
+async fn test_free_text_fields() {
+    use stac_os_rs::store::{NodeKind, COLLECTIONS_INDEX, ITEMS_INDEX, ROOT_CATALOG_ID};
+
+    let Some((app, state)) = test_app(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    // Seed a collection + item carrying a searchable title and a
+    // custom prop (root scope — the catalog tree isn't needed).
+    let col = uniq("ft-col");
+    let id = uniq("ft-item");
+    let mut it = common::item(&id, &col);
+    it["properties"]["title"] = json!("Alpine Meadow");
+    it["properties"]["my_tag"] = json!("qzx9");
+    state
+        .store
+        .index_document(COLLECTIONS_INDEX, &col, collection(&col))
+        .await
+        .unwrap();
+    state
+        .store
+        .set_parents(
+            &col,
+            vec![ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .index_document(ITEMS_INDEX, &format!("{id}|{col}"), it.clone())
+        .await
+        .unwrap();
+
+    // Default fields: `title` hits, the unlisted `my_tag` misses.
+    let (s, body) = call(&app, "GET", "/search?q=alpine", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 1);
+    let (s, body) = call(&app, "GET", "/search?q=qzx9", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 0);
+
+    // FREE_TEXT_FIELDS override: the custom prop becomes searchable.
+    let Some((app2, state2)) = test_app_flags(TestFlags {
+        free_text_fields: Some(vec!["properties.my_tag".to_string()]),
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    state2
+        .store
+        .index_document(COLLECTIONS_INDEX, &col, collection(&col))
+        .await
+        .unwrap();
+    state2
+        .store
+        .set_parents(
+            &col,
+            vec![ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+    state2
+        .store
+        .index_document(ITEMS_INDEX, &format!("{id}|{col}"), it)
+        .await
+        .unwrap();
+    let (s, body) = call(&app2, "GET", "/search?q=qzx9", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 1);
+}
+
 #[tokio::test]
 async fn test_search_pagination() {
     let Some(state) = test_state(true).await else {
