@@ -316,7 +316,7 @@ This is a prototype — the endpoints exist but several are shallow. Known gaps:
 
 **Hierarchy & data**
 - Children/descendants capped at 10k per level — real pagination needed on the DAG itself
-- Reserved IDs: a catalog named `search` collides with the static route — should 400 on create
+- Reserved IDs: catalog ids `search` (collides with the static `/catalogs/search` route) and `root` (the implicit root node) 400 on create/link
 - Orphaned docs: a hierarchy node whose document is missing is silently skipped in children listings and `rel: child` links — needs a consistency check
 - User-provided `links` follow upstream `resolve_links` semantics — inferred structural rels (`self`, `item`, `parent`, `collection`, `root`, `items`) are stripped on write; stored user links merge with generated links on read
 
