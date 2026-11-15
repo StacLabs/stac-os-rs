@@ -369,7 +369,7 @@ async fn test_filter_crs_validation() {
         assert_eq!(s, StatusCode::OK, "{path}");
     }
     let bad = [
-        format!("/search?filter-crs=EPSG:4326"),
+        "/search?filter-crs=EPSG:4326".to_string(),
         format!("/catalogs/{cat}/search?filter-crs=EPSG:4326"),
         format!("/collections/{col}/items?filter-crs=EPSG:4326"),
         format!("/catalogs/{cat}/collections/{col}/items?filter-crs=EPSG:4326"),
