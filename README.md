@@ -231,7 +231,7 @@ Or use the **Makefile**, which handles the Docker dependency for you (`make test
 
 `stac-os-rs` is usable as a library — the router is composable axum, so consumers merge their own extension routes sharing the same `AppState` (store, link engine, config). Three seams:
 
-- `stac_os_rs::read_router()` / `stac_os_rs::transaction_router()` — mount selectively (e.g. transactions behind auth middleware), or `build_app(state)` for the whole surface
+- `stac_os_rs::read_router()` / `transaction_router()` (plus `catalogs_read_router()` / `catalogs_transaction_router()` for the multi-tenant surface) — mount selectively (e.g. transactions behind auth middleware), or `build_app(state)` for the whole surface
 - `handlers::AppState` fields are public — your handlers can take `State<Arc<AppState>>` and call `state.store.*` directly
 - Standard axum composition: `.merge()` extra routes, `.layer()` middleware
 

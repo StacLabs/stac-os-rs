@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `children#type-filter` is catalogs-gated
 - README OpenAPI note pointed at `src/handlers.rs` — it's the
   `src/handlers/` directory
+- README "Extending" section now mentions the
+  `catalogs_read_router()`/`catalogs_transaction_router()` seams
 
 ## [0.8.0] - 2026-11-11
 
