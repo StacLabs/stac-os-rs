@@ -486,6 +486,7 @@ async fn items_page(
     query: &ListQuery,
     scoped_catalog_id: Option<&str>,
 ) -> Result<(ItemCollection, u64), ApiError> {
+    check_filter_crs(query.filter_crs.as_deref())?;
     let (limit, _) = list_window(
         query.limit,
         query.token.as_deref(),

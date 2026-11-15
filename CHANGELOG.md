@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `filter-crs` is now validated: only
+  `http://www.opengis.net/def/crs/OGC/1.3/CRS84` is accepted —
+  anything else returns 400 on `/search`, `/catalogs/**/search`, and
+  both items listings (OGC Features Part 3; upstream declares the
+  param but never validates it). It was previously silently ignored
 - CONFORMANCE.md no longer lists `startsWith`/`endsWith` under the
   `item-search#query` operators — they return 400 (unimplemented
   upstream too, where they're commented out of the `Operator` enum)
