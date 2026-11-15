@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- CONFORMANCE.md no longer lists `startsWith`/`endsWith` under the
+  `item-search#query` operators — they return 400 (unimplemented
+  upstream too, where they're commented out of the `Operator` enum)
+- README catalog routes table gains the missing
+  `GET /catalogs/{id}/queryables` row
+- README GET search param list now includes `intersects`, `token`,
+  `query`, `filter-lang`, and `filter-crs`
+- README `ENABLE_CATALOGS_ROUTE` description corrected: `v1.0.0/children`
+  and `GET /children` stay mounted with catalogs off — only
+  `children#type-filter` is catalogs-gated
+- README OpenAPI note pointed at `src/handlers.rs` — it's the
+  `src/handlers/` directory
+- README "Extending" section now mentions the
+  `catalogs_read_router()`/`catalogs_transaction_router()` seams
+
 ## [0.8.0] - 2026-11-11
 
 ### Added

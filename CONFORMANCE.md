@@ -85,7 +85,7 @@ Legend:
 | Class | Status | Notes |
 |---|---|---|
 | `item-search#fields`, `ogcapi-features#fields` | ✅ | `include`/`exclude` incl. nested paths; GET `-`-prefix syntax |
-| `item-search#query`, `ogcapi-features#query` | ✅ | STACQL operators `eq`/`neq`/`lt`/`lte`/`gt`/`gte`/`startsWith`/`endsWith`/`contains`/`in` |
+| `item-search#query`, `ogcapi-features#query` | ✅ | STACQL operators `eq`/`ne`/`neq`/`lt`/`lte`/`gt`/`gte`/`in`/`contains`; `startsWith`/`endsWith` return 400 (unimplemented upstream too — commented out in its `Operator` enum) |
 | `v1.1.0/item-search#sort`, `v1.1.0/ogcapi-features#sort` | ✅ | `sortby` GET `+`/`-` and POST `{field, direction}` |
 | `v1.1.0/item-search#sortables` + `GET /sortables` | ✅ | Landing-page sortables link uses the canonical OGC rel URI |
 | `ogcapi-features-5/conf/sortables` + `/collections/{id}/sortables` | ✅ | |
