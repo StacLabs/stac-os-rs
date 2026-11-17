@@ -109,6 +109,19 @@ async fn main() {
             .map(|n| n as usize)
             .unwrap_or(5000),
         max_batch_error_size: env_u64("MAX_BATCH_ERROR_SIZE").map(|n| n as usize),
+        // `FREE_TEXT_FIELDS` (upstream): comma-separated multi_match
+        // fields for item-search `q`. Unset/empty → upstream defaults.
+        free_text_fields: std::env::var("FREE_TEXT_FIELDS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(stac_os_rs::handlers::default_free_text_fields),
     });
     let app = build_app(state);
 

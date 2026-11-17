@@ -62,7 +62,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`, `queryables`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
 | GET | `/collections/{collection_id}/queryables` | Per-collection Queryables — core fields merged with the items index mapping; `platform.enum` populated from indexed values |
-| GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
+| GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `?q=` free text (`FREE_TEXT_FIELDS`); `filter`, `query`, `bbox`, `datetime`, `ids`; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
 | GET | `/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 
 **Multi-tenant catalogs routes** — mounted only while `ENABLE_CATALOGS_ROUTE` is on (the default)
@@ -77,7 +77,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/catalogs/{catalog_id}/children` | `?type=Catalog\|Collection` filter, `?limit=&token=` paging; `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging; `?sortby=±field` (mapping-driven sortables), `?fields=±field` projection, `?q=` free text, `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}` | Contextual `self`/`parent`, alt parents as `related`/`duplicate` |
-| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `application/geo+json`, scoped item links |
+| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `?q=` free text (`FREE_TEXT_FIELDS`); `filter`, `query`, `bbox`, `datetime`, `ids`; `application/geo+json`, scoped item links |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 | GET/POST | `/catalogs/search` | Whole-registry scope. Same filters as `/search` |
 | GET/POST | `/catalogs/{catalog_id}/search` | Same filters, intersected with the catalog's descendant collections |
@@ -217,9 +217,10 @@ All variables are read once at startup — changing them requires a restart.
 |----------|-------------|---------|----------|
 | `USE_DATETIME` | `false` = items carrying `start_datetime`/`end_datetime` are datetime-filtered on the range alone, ignoring `properties.datetime` (matches upstream `USE_DATETIME=false` query semantics). | `true` | Optional |
 | `DATABASE_REFRESH` | Refresh policy on writes: `false` accepts up-to-`refresh_interval` search lag (GET-by-id stays real-time) — the fast ingest setting; `true` refreshes inline before responding; `wait_for` parks until the next refresh tick. Hierarchy link/unlink and PATCH writes force `true` regardless — they need same-flow read-after-write (upstream `patch_item` forces it too). `compose.yml` sets `true`, mirroring sfeos's own compose override. | `false` | Optional |
+| `FREE_TEXT_FIELDS` | Comma-separated `multi_match` field list for item free-text `q` (`/search`, `/catalogs/*/search`, `/collections/{id}/items`) — boost syntax allowed (e.g. `properties.title^3,properties.my_field`). Set this to search custom properties. | `id, collection, properties.title^3, properties.description, properties.keywords` | Optional |
 | `REQUIRE_IF_MATCH` | `true` = writes that accept an `If-Match` precondition require the header — a missing one returns 428 (checked before body parsing/validation). | `false` | Optional |
 
-Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `FREE_TEXT_FIELDS`, `MAX_BATCH_SIZE` (chunked batch writes), custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
+Upstream sfeos env vars **not yet wired** — planned but currently inert if set: `ENABLE_REDIS_QUEUE`/`VALIDATE_BEFORE_QUEUE` (async writes), `MAX_BATCH_SIZE` (chunked batch writes), custom-mapping/sort-remap vars, and the `ES_*` connection family (we take a single `OPENSEARCH_URL`).
 
 Other handy commands: `cargo check` (fast type-check, no binary), `cargo test` (unit + integration tests — integration tests need OpenSearch running, and skip automatically if it's not), `cargo add <crate>` (add a dependency).
 

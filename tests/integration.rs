@@ -396,6 +396,164 @@ async fn test_filter_crs_validation() {
     }
 }
 
+/// `FREE_TEXT_FIELDS` — item-search `q` runs `multi_match` over the
+/// configured field list. Upstream defaults (id, collection,
+/// title^3, description, keywords) miss custom props until listed.
+#[tokio::test]
+async fn test_free_text_fields() {
+    use stac_os_rs::store::{NodeKind, COLLECTIONS_INDEX, ITEMS_INDEX, ROOT_CATALOG_ID};
+
+    let Some((app, state)) = test_app(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    // Seed a collection + item carrying a searchable title and a
+    // custom prop (root scope — the catalog tree isn't needed).
+    let col = uniq("ft-col");
+    let id = uniq("ft-item");
+    let mut it = common::item(&id, &col);
+    it["properties"]["title"] = json!("Alpine Meadow");
+    it["properties"]["my_tag"] = json!("qzx9");
+    state
+        .store
+        .index_document(COLLECTIONS_INDEX, &col, collection(&col))
+        .await
+        .unwrap();
+    state
+        .store
+        .set_parents(
+            &col,
+            vec![ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .index_document(ITEMS_INDEX, &format!("{id}|{col}"), it.clone())
+        .await
+        .unwrap();
+
+    // Default fields: `title` hits, the unlisted `my_tag` misses.
+    let (s, body) = call(&app, "GET", "/search?q=alpine", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 1);
+    let (s, body) = call(&app, "GET", "/search?q=qzx9", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 0);
+
+    // FREE_TEXT_FIELDS override: the custom prop becomes searchable.
+    let Some((app2, state2)) = test_app_flags(TestFlags {
+        free_text_fields: Some(vec!["properties.my_tag".to_string()]),
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    state2
+        .store
+        .index_document(COLLECTIONS_INDEX, &col, collection(&col))
+        .await
+        .unwrap();
+    state2
+        .store
+        .set_parents(
+            &col,
+            vec![ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+    state2
+        .store
+        .index_document(ITEMS_INDEX, &format!("{id}|{col}"), it)
+        .await
+        .unwrap();
+    let (s, body) = call(&app2, "GET", "/search?q=qzx9", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 1);
+}
+
+/// `q` on the items listings (features binding) — same `FREE_TEXT_FIELDS`
+/// clause as item search, and the `next` link echoes all params forward.
+#[tokio::test]
+async fn test_items_listing_q() {
+    use stac_os_rs::store::{NodeKind, COLLECTIONS_INDEX, ITEMS_INDEX, ROOT_CATALOG_ID};
+
+    let Some((app, state)) = test_app(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let col = uniq("ftq-col");
+    let mut a = common::item(&uniq("ftq-a"), &col);
+    a["properties"]["title"] = json!("Alpine Meadow");
+    let mut b = common::item(&uniq("ftq-b"), &col);
+    b["properties"]["title"] = json!("Alpine Ridge");
+    let mut c = common::item(&uniq("ftq-c"), &col);
+    c["properties"]["title"] = json!("Desert Dune");
+    state
+        .store
+        .index_document(COLLECTIONS_INDEX, &col, collection(&col))
+        .await
+        .unwrap();
+    state
+        .store
+        .set_parents(
+            &col,
+            vec![ROOT_CATALOG_ID.to_string()],
+            NodeKind::Collection,
+        )
+        .await
+        .unwrap();
+    for it in [a, b, c] {
+        let key = format!("{}|{col}", it["id"].as_str().unwrap());
+        state
+            .store
+            .index_document(ITEMS_INDEX, &key, it)
+            .await
+            .unwrap();
+    }
+
+    // `q` filters the global listing; a non-matching term empties it.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?q=alpine"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 2);
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?q=zebra"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 0);
+
+    // `q` (and every other param) survives pagination via the raw-query echo.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?q=alpine&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let next = body["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .expect("next link");
+    let href = next["href"].as_str().unwrap();
+    assert!(href.contains("q=alpine"), "{href}");
+}
+
 #[tokio::test]
 async fn test_search_pagination() {
     let Some(state) = test_state(true).await else {

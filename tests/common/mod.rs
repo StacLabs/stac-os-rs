@@ -37,7 +37,7 @@ pub async fn test_state(enable_transactions: bool) -> Option<Arc<AppState>> {
 /// Feature-flag bundle for `test_state_opts` — mirrors the AppState
 /// env knobs so tests can compose app variants without env mutation
 /// (env reads are racy under parallel test runs).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct TestFlags {
     /// `ENABLE_CATALOGS_ROUTE=false` — catalogs surface unmounted.
     /// Named for the action (disable) so the bool default keeps the
@@ -49,6 +49,8 @@ pub struct TestFlags {
     pub enable_topology_validation: bool,
     pub max_topology_vertices: usize,
     pub max_batch_error_size: Option<usize>,
+    /// `FREE_TEXT_FIELDS` override — `None` uses the upstream defaults.
+    pub free_text_fields: Option<Vec<String>>,
 }
 
 pub async fn test_state_full(
@@ -155,6 +157,10 @@ async fn test_state_opts(
             flags.max_topology_vertices
         },
         max_batch_error_size: flags.max_batch_error_size,
+        free_text_fields: flags
+            .free_text_fields
+            .clone()
+            .unwrap_or_else(stac_os_rs::handlers::default_free_text_fields),
     }))
 }
 

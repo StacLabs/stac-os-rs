@@ -101,6 +101,10 @@ pub struct AppState {
     /// failures than this aborts the batch unconditionally
     /// ("Validation error threshold exceeded"). None = no cutoff.
     pub max_batch_error_size: Option<usize>,
+    /// `FREE_TEXT_FIELDS` — `multi_match` field list for item-search
+    /// `q` (boost syntax like `properties.title^3` allowed). Unset or
+    /// empty falls back to [`default_free_text_fields`].
+    pub free_text_fields: Vec<String>,
 }
 
 impl AppState {
@@ -134,6 +138,22 @@ pub(crate) async fn validate_stac_doc(
         Ok(Err(e)) => Err(validation_error(e)),
         Ok(Ok(_)) => Ok(()),
     }
+}
+
+/// `FREE_TEXT_FIELDS` default — upstream's curated `multi_match` field
+/// list for item-search `q` (`title^3` is a field boost). Custom
+/// properties are searched by listing them in the env var.
+pub fn default_free_text_fields() -> Vec<String> {
+    [
+        "id",
+        "collection",
+        "properties.title^3",
+        "properties.description",
+        "properties.keywords",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// `VALIDATOR_POOL_SIZE` default — max in-flight batch-member
@@ -383,38 +403,6 @@ pub(crate) fn list_next_link(
     Some(json!({ "rel": "next", "href": href }))
 }
 
-/// `&k=v&...` suffix for `list_next_link`'s `extra` param — percent-
-/// encodes values so filters like `id LIKE 'a-%'` survive the link.
-pub(crate) fn extra_params(pairs: &[(&str, &str)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| {
-            let enc: String = v
-                .bytes()
-                .map(|b| match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                        (b as char).to_string()
-                    }
-                    _ => format!("%{b:02X}"),
-                })
-                .collect();
-            format!("&{k}={enc}")
-        })
-        .collect()
-}
-
-/// `next`-link `extra` carrying `filter`/`filter-lang` params forward.
-pub(crate) fn filter_link_extra(filter: Option<&str>, filter_lang: Option<&str>) -> Option<String> {
-    let mut pairs = Vec::new();
-    if let Some(f) = filter {
-        pairs.push(("filter", f));
-    }
-    if let Some(l) = filter_lang {
-        pairs.push(("filter-lang", l));
-    }
-    (!pairs.is_empty()).then(|| extra_params(&pairs))
-}
-
 /// Raw query string minus `limit`/`token`, returned as a `&k=v…`
 /// suffix — echoed verbatim into `next` hrefs so unrelated params
 /// survive pagination (upstream `_next_query` behavior).
@@ -611,6 +599,23 @@ pub(crate) fn split_q_terms(raw: &str) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Item free-text `q` clause (upstream `apply_free_text_filter`):
+/// `multi_match` + `lenient` — lenient skips fields a term can't parse
+/// instead of failing the whole query, and avoids `simple_query_string`'s
+/// operator syntax mangling hyphenated terms like `sentinel-2`. `fields`
+/// is `AppState::free_text_fields` (`FREE_TEXT_FIELDS`). Shared by the
+/// item-search and features (`/collections/{id}/items`) bindings.
+pub(crate) fn item_free_text_clause(terms: &[String], fields: &[String]) -> serde_json::Value {
+    json!({"multi_match": {
+        "query": terms.join(" "),
+        "fields": fields,
+        "type": "best_fields",
+        "fuzziness": "AUTO",
+        "lenient": true,
+        "operator": "or",
+    }})
 }
 
 /// 404 unless `catalog_id` is the implicit root or a catalog document —

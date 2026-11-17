@@ -4,7 +4,7 @@ use super::metadata::items_sortable_fields;
 use crate::api_types::{ItemCollection, Search};
 use crate::store::{COLLECTIONS_INDEX, ITEMS_INDEX};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
@@ -15,7 +15,8 @@ use stac::{Bbox, Item, Link};
 use std::sync::Arc;
 
 /// GET /collections/{id}/items — global item listing for a collection.
-/// Upstream-compatible `?limit=&token=` paging only.
+/// Upstream-compatible `?limit=&token=` paging plus the features-binding
+/// filters (`sortby`/`fields`/`q`/`query`/`filter`/`bbox`/`datetime`/`ids`).
 #[utoipa::path(
     get,
     path = "/collections/{collection_id}/items",
@@ -30,6 +31,7 @@ use std::sync::Arc;
 )]
 pub async fn list_collection_items(
     Path(collection_id): Path<String>,
+    RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -57,7 +59,7 @@ pub async fn list_collection_items(
         limit,
         offset,
         &collection,
-        filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref()).as_deref(),
+        pagination_extra(raw.as_deref()).as_deref(),
     ) {
         collection.links.push(next);
     }
@@ -441,6 +443,7 @@ fn errors_grouped_by_msg(errors: &[serde_json::Value]) -> serde_json::Value {
 )]
 pub async fn list_scoped_items(
     Path((catalog_id, collection_id)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -469,7 +472,7 @@ pub async fn list_scoped_items(
         limit,
         offset,
         &collection,
-        filter_link_extra(query.filter.as_deref(), query.filter_lang.as_deref()).as_deref(),
+        pagination_extra(raw.as_deref()).as_deref(),
     ) {
         collection.links.push(next);
     }
@@ -477,7 +480,7 @@ pub async fn list_scoped_items(
 }
 
 /// Shared items-listing pipeline: `?limit=&token=` + the features-binding
-/// filters (`ids`/`query`/`filter`/`bbox`/`datetime`) -> paginated search.
+/// filters (`ids`/`query`/`filter`/`bbox`/`datetime`/`q`) -> paginated search.
 /// `scoped_catalog_id` selects scoped vs canonical item link paths.
 /// Returns the collection and the page offset (for the `next` link).
 async fn items_page(
@@ -591,6 +594,12 @@ async fn items_page(
             }
         };
         extra_filters.push(crate::store::cql2_clause(&filter).map_err(bad_filter)?);
+    }
+    // Features-binding `q` — same free-text clause as item search
+    // (`apply_free_text_filter`, `FREE_TEXT_FIELDS` field list).
+    let q_terms = query.q.as_deref().map(split_q_terms).unwrap_or_default();
+    if !q_terms.is_empty() {
+        extra_filters.push(item_free_text_clause(&q_terms, &state.free_text_fields));
     }
     let (mut items, matched) = state
         .store
