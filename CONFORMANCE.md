@@ -124,7 +124,6 @@ Legend:
 | Poly-hierarchy: one `parent` per scoped read, `related` for alternates | ✅ | `CATALOGS_HIDE_ALTERNATE_PARENTS` opt-out |
 | Transaction surface (`…/transaction` class, `ENABLE_TRANSACTIONS_EXTENSIONS`) | ✅ | Link/unlink is non-destructive; orphans adopt to root |
 | `conformance` link on scoped catalog docs | ✅ | |
-| `POST /catalogs/{id}/bulk` | — | Planned; currently 404/405 (distinct from `_bulk` item ingest) |
 
 ## Transaction (`ogcapi-features/extensions/transaction`)
 
@@ -142,6 +141,10 @@ Legend:
 - **Context extension** — *deprecated* upstream. Top-level
   `numberMatched`/`numberReturned` is the current required form.
 - **Aggregation extension** — not implemented, not advertised.
+- **`POST /catalogs/{id}/bulk`** — not planned; upstream has no
+  catalog-scoped bulk route (its only bulk route is
+  `POST /collections/{id}/bulk_items`, which we implement), and item
+  writes stay on the core transaction surface upstream-style.
 - **Redis queue / async writes** — out of scope; `202` async path unused.
 - **Advanced free-text** (`#advanced-free-text`) — only basic semantics
   are targeted.
@@ -156,7 +159,6 @@ link media type, `Location` on create, collections `q` comma-split,
 
 Nothing currently claimed-but-missing. Remaining honest gaps are all
 unclaimed: CQL2 classes we don't advertise (temporal functions,
-property-property, CASEI/ACCENTI, array ops, arithmetic),
-`POST /catalogs/{id}/bulk`, deep paging beyond 10k, and a
-`/collection-queryables` endpoint (the spec's proposed path — ours is
-per-collection instead).
+property-property, CASEI/ACCENTI, array ops, arithmetic), deep paging
+beyond 10k, and a `/collection-queryables` endpoint (the spec's
+proposed path — ours is per-collection instead).

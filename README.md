@@ -12,7 +12,6 @@ This project would not be possible without the contributors to [stac-fastapi](ht
 - [API Routes](#api-routes)
   - [Read surface — always mounted](#read-surface--always-mounted)
   - [Transactions](#transactions--require-enable_transactions_extensions)
-  - [Planned](#planned--currently-404405)
 - [Getting Started (coming from Python?)](#getting-started-coming-from-python)
   - [Configuration Reference](#configuration-reference)
 - [Extending (custom routes)](#extending-custom-routes)
@@ -127,12 +126,6 @@ Scoped reads 404 when the target collection isn't inside the catalog's DAG. Item
 Status codes: `201` create (Mode A), `200` link (Mode B `{"id": ...}`) / update, `204` delete/unlink, `400` bad request (`limit=0`, id mismatch, invalid search), `404` missing resource or edge, `409` id collision / full-body repost, `412` failed `If-Match` precondition.
 
 **Optimistic concurrency (ETag/`If-Match`):** single-resource GET and write responses carry a strong `ETag` (`"<primary_term>-<seq_no>-<indexhash>"`, suffixed `-gzip`/`-br` when the body is compressed — RFC 9110 §8.8.1). `PUT`/`PATCH`/`DELETE` honor `If-Match` (`*`, tag lists, weak/malformed tags never match); the checked version conditions the write itself, so check-and-write is atomic (`409`→`412` on a lost race).
-
-### Planned — currently 404/405
-
-| Method | Path | Status |
-|---|---|---|
-| POST | `/catalogs/{id}/bulk` | 404 — bulk transactions extension |
 
 ## Getting Started (coming from Python?)
 
