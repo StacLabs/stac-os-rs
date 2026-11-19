@@ -1,7 +1,7 @@
 // src/handlers/search.rs
 use super::common::*;
 use crate::api_types::{GetSearch, ItemCollection, Search};
-use crate::store::{search_offset, CATALOGS_INDEX, MAX_SEARCH_LIMIT, ROOT_CATALOG_ID};
+use crate::store::{item_sort_clauses, CATALOGS_INDEX, ROOT_CATALOG_ID};
 use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
@@ -78,24 +78,36 @@ async fn run_scoped_search(
         return Err(ApiError::NotFound(scope_id.to_string()));
     }
 
-    // Pagination token → numeric offset (rejected before any lookup).
+    // Pagination token → `search_after` cursor — decoded before
+    // extension parsing and the empty-scope short-circuit, so a
+    // malformed token 400s even on an empty scope (upstream #935
+    // semantics). A numeric token is legacy leniency: treated as a
+    // raw offset (`from`).
+    let mut cursor = None;
     if let Some(t) = search.items.additional_fields.get("token").cloned() {
         if !t.is_null() {
-            let offset = match &t {
-                serde_json::Value::String(s) => decode_item_token(s)?,
-                serde_json::Value::Number(n) => n
-                    .as_u64()
-                    .ok_or_else(|| ApiError::BadRequest("Invalid pagination token.".to_string()))?,
+            match &t {
+                serde_json::Value::String(s) => {
+                    cursor = Some(decode_search_after_token(
+                        s,
+                        item_sort_clauses(&search.items.sortby).len(),
+                    )?);
+                }
+                serde_json::Value::Number(n) => {
+                    let offset = n.as_u64().ok_or_else(|| {
+                        ApiError::BadRequest("Invalid pagination token.".to_string())
+                    })?;
+                    search
+                        .items
+                        .additional_fields
+                        .insert("offset".to_string(), json!(offset));
+                }
                 _ => {
                     return Err(ApiError::BadRequest(
                         "Invalid pagination token.".to_string(),
                     ))
                 }
-            };
-            search
-                .items
-                .additional_fields
-                .insert("offset".to_string(), json!(offset));
+            }
         }
         search.items.additional_fields.shift_remove("token");
     }
@@ -276,13 +288,14 @@ async fn run_scoped_search(
         return Ok(geo_json(empty()?));
     }
 
-    let (mut items, matched) = state
+    let (mut items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
             &search.collections,
             &search,
             extra_filters,
             state.default_item_limit,
+            cursor,
         )
         .await?;
     let base = &state.base_url;
@@ -318,14 +331,9 @@ async fn run_scoped_search(
     // 4. Pagination links — upstream PagingLinks: GET merges the request
     // URL with a `token` query param (`method: GET`); POST carries the
     // search body + `token` (`method: POST`). Self = the request URL.
-    let limit = search
-        .items
-        .limit
-        .unwrap_or(state.default_item_limit)
-        .min(MAX_SEARCH_LIMIT);
-    let offset = search_offset(&search);
+    // `prev` is a reverse-direction `search_after` token — upstream
+    // needs Redis to reconstruct it; the flipped sort does it statelessly.
     let get_uri = req.as_ref().filter(|(_, is_get)| *is_get).map(|(u, _)| u);
-    let base = &state.base_url;
     let self_href = match &req {
         Some((u, _)) => format!("{base}{u}"),
         None => {
@@ -341,16 +349,18 @@ async fn run_scoped_search(
         None => self_href.clone(),
     };
     collection.links.push(link_json(self_href, "self"));
-    if offset + returned < matched {
+    if let Some(vals) = next_vals {
+        let token = encode_search_after_token(&vals, false);
         collection.links.push(match get_uri {
-            Some(u) => page_link_get("next", base, u, offset + limit),
-            None => page_link("next", &post_href, &search, offset + limit),
+            Some(u) => page_link_get("next", base, u, &token),
+            None => page_link("next", &post_href, &search, &token),
         });
     }
-    if offset > 0 {
+    if let Some(vals) = prev_vals {
+        let token = encode_search_after_token(&vals, true);
         collection.links.push(match get_uri {
-            Some(u) => page_link_get("prev", base, u, offset.saturating_sub(limit)),
-            None => page_link("prev", &post_href, &search, offset.saturating_sub(limit)),
+            Some(u) => page_link_get("prev", base, u, &token),
+            None => page_link("prev", &post_href, &search, &token),
         });
     }
     Ok(geo_json(collection))
@@ -358,7 +368,7 @@ async fn run_scoped_search(
 
 /// GET-side pagination link: rel + href (request URL with `token`
 /// merged in) + `method: GET` — upstream `PagingLinks.link_next`.
-fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, offset: u64) -> Link {
+fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, token: &str) -> Link {
     let pq = uri
         .path_and_query()
         .map(|pq| pq.as_str())
@@ -366,7 +376,10 @@ fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, offset: u64) -> L
     let (path, query) = pq.split_once('?').unwrap_or((pq, ""));
     let kept: Vec<&str> = query
         .split('&')
-        .filter(|p| !p.is_empty() && !p.starts_with("token="))
+        .filter(|p| {
+            let k = p.split('=').next().unwrap_or("");
+            !k.is_empty() && k != "token"
+        })
         .collect();
     let mut merged = path.to_string();
     merged.push('?');
@@ -375,7 +388,7 @@ fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, offset: u64) -> L
         merged.push('&');
     }
     merged.push_str("token=");
-    merged.push_str(&encode_item_token(offset));
+    merged.push_str(token);
     let mut link = Link::new(format!("{base}{merged}"), rel);
     link.method = Some("GET".to_string());
     link.r#type = Some("application/json".to_string());
@@ -384,9 +397,9 @@ fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, offset: u64) -> L
 
 /// A STAC pagination link: rel + href + `method: POST` + the original
 /// search body with an opaque `token` for the next page.
-fn page_link(rel: &str, href: &str, search: &Search, offset: u64) -> Link {
+fn page_link(rel: &str, href: &str, search: &Search, token: &str) -> Link {
     let mut body = serde_json::to_value(search).unwrap_or_default();
-    body["token"] = json!(encode_item_token(offset));
+    body["token"] = json!(token);
     let mut link = Link::new(href, rel);
     link.method = Some("POST".to_string());
     link.r#type = Some("application/geo+json".to_string());

@@ -24,6 +24,58 @@ pub fn uniq(prefix: &str) -> String {
     format!("{prefix}-{nanos}")
 }
 
+/// Stale `it-*` indices from earlier runs — `make test*` sweeps after
+/// a run, but plain `cargo test` leaves them and they accumulate until
+/// the cluster chokes on shard count. Sweep once per test binary,
+/// deleting only indices created before this process started: the
+/// `it-<nanos>` prefix is a creation timestamp, so a wholesale
+/// `DELETE it-*` would race sibling tests' fresh indices on parallel
+/// threads. Test binaries run sequentially under `cargo test`, so
+/// nothing else can hold `it-*` indices older than this process.
+static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROCESS_START: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+
+async fn sweep_stale_test_indices(url: &str) {
+    let start = *PROCESS_START.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    });
+    if SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let client = reqwest::Client::new();
+    let Ok(resp) = client
+        .get(format!("{url}/_cat/indices/it-*?h=index&format=json"))
+        .send()
+        .await
+    else {
+        return;
+    };
+    let Ok(indices) = resp.json::<Vec<Value>>().await else {
+        return;
+    };
+    let stale: Vec<&str> = indices
+        .iter()
+        .filter_map(|v| v["index"].as_str())
+        .filter(|name| {
+            name.strip_prefix("it-")
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|n| n.parse::<u128>().ok())
+                .is_some_and(|n| n < start)
+        })
+        .collect();
+    // Chunked deletes — a few hundred `it-*` names in one URI would
+    // exceed OpenSearch's `http.max_initial_line_length` (4KB).
+    for chunk in stale.chunks(50) {
+        let _ = client
+            .delete(format!("{url}/{}", chunk.join(",")))
+            .send()
+            .await;
+    }
+}
+
 /// None if OpenSearch is unreachable — caller should skip the test.
 pub async fn test_state(enable_transactions: bool) -> Option<Arc<AppState>> {
     test_state_full(enable_transactions, false).await
@@ -32,8 +84,9 @@ pub async fn test_state(enable_transactions: bool) -> Option<Arc<AppState>> {
 /// Full control over feature flags (transactions, hide_alternate_parents).
 ///
 /// Each call gets a unique `it-<nanos>` index prefix — every test runs
-/// against isolated, empty indices. `make test*` sweeps `it-*` after the
-/// run (`curl -XDELETE "$OPENSEARCH_URL/it-*"` for manual cleanup).
+/// against isolated, empty indices. Stale `it-*` indices are swept once
+/// per test binary at startup (`sweep_stale_test_indices`); `make test*`
+/// additionally sweeps after a run.
 /// Feature-flag bundle for `test_state_opts` — mirrors the AppState
 /// env knobs so tests can compose app variants without env mutation
 /// (env reads are racy under parallel test runs).
@@ -107,11 +160,16 @@ async fn test_state_opts(
 ) -> Option<Arc<AppState>> {
     let url =
         std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
+    // `Store::connect` only builds a client (no I/O) — probe the
+    // cluster so an unreachable OpenSearch yields the documented
+    // `None` (skip), not a panic at `ensure_indices`.
+    reqwest::get(&url).await.ok()?;
+    let store = Store::connect(&url).ok()?;
+    sweep_stale_test_indices(&url).await;
     // Tests write-then-search constantly — pin inline refresh so reads
     // never race the index's refresh interval (production default is
     // `DATABASE_REFRESH=false`, which this deliberately overrides).
-    let store = Store::connect(&url)
-        .ok()?
+    let store = store
         .with_index_prefix(uniq("it"))
         .with_refresh(opensearch::params::Refresh::True);
     // OpenSearch answered but index creation failed — the environment is

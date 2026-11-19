@@ -7,7 +7,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use stac::{Catalog, Collection, Item, Link};
 use std::collections::{HashMap, HashSet};
 
@@ -1149,12 +1149,67 @@ pub(crate) async fn collection_doc(
     Ok(doc)
 }
 
-/// Opaque pagination token: url-safe base64 of a JSON `[offset]` —
+/// Opaque pagination token for the offset-paged listings (catalogs,
+/// children, collections): url-safe base64 of a JSON `[offset]` —
 /// upstream tokens are a base64'd JSON list too, so clients can't tell
-/// the difference.
+/// the difference. Item search/listings use `search_after` cursors
+/// instead (`encode_search_after_token`).
 pub(crate) fn encode_item_token(offset: u64) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     URL_SAFE_NO_PAD.encode(format!("[{offset}]"))
+}
+
+/// Item pagination token = url-safe base64 of a JSON payload (upstream
+/// `encode_search_after_to_token`): a bare `[v1..vN]` sort-values array
+/// for `next` — the same shape upstream emits — or
+/// `{"a": [v1..vN], "r": 1}` for `prev`, marking a reverse-direction
+/// cursor (`search_after` against the flipped sort spec — a stateless
+/// `prev` link where upstream needs Redis).
+pub(crate) fn encode_search_after_token(vals: &[Value], reverse: bool) -> String {
+    use base64::{engine::general_purpose::URL_SAFE, Engine};
+    let payload = if reverse {
+        json!({"a": vals, "r": 1})
+    } else {
+        json!(vals)
+    };
+    URL_SAFE.encode(payload.to_string())
+}
+
+/// Strict item token decode (upstream `decode_search_after_token_shared`):
+/// the payload must be a JSON list — or a `{"a": [..], "r": 1}` reverse
+/// marker — carrying exactly one sort value per sort clause. Anything
+/// else is a 400 ("Invalid pagination token."). `sort_len` is the
+/// `item_sort_clauses` arity for the current request's sort.
+pub(crate) fn decode_search_after_token(
+    token: &str,
+    sort_len: usize,
+) -> Result<crate::store::PageCursor, ApiError> {
+    use base64::{engine::general_purpose::URL_SAFE, Engine};
+    let invalid = || ApiError::BadRequest("Invalid pagination token.".to_string());
+    let raw = URL_SAFE
+        .decode(token)
+        .or_else(|_| {
+            // Older tokens were emitted unpadded.
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)
+        })
+        .map_err(|_| invalid())?;
+    let payload: Value = serde_json::from_slice(&raw).map_err(|_| invalid())?;
+    let (vals, reverse) = match payload {
+        Value::Array(v) => (v, false),
+        Value::Object(o) if matches!(o.get("r"), Some(Value::Number(_))) => match o.get("a") {
+            Some(Value::Array(v)) => (v.clone(), true),
+            _ => return Err(invalid()),
+        },
+        _ => return Err(invalid()),
+    };
+    if vals.len() != sort_len {
+        return Err(invalid());
+    }
+    Ok(if reverse {
+        crate::store::PageCursor::Reverse(vals)
+    } else {
+        crate::store::PageCursor::Forward(vals)
+    })
 }
 
 pub(crate) fn decode_item_token(token: &str) -> Result<u64, ApiError> {

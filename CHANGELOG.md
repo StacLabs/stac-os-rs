@@ -17,8 +17,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `id, collection, properties.*` (behavior change: terms in arbitrary
   custom properties no longer match unless the field is listed)
 
+### Changed
+
+- Item paging (`/search`, `/catalogs/{id}/search`, both items
+  listings) moved from `from`/`size` offset paging to `search_after`
+  cursors (upstream `execute_search` semantics): the `token` carries
+  the page edge's sort values as a base64 JSON list, a `limit + 1`
+  lookahead detects the next page — a full page stands in when the
+  lookahead slot can't fit the result window, so an exact-boundary
+  final page can emit a `next` link that resolves empty — and
+  paging past OpenSearch's 10k `index.max_result_window` now works.
+  Tokens are strict — any payload that is not a list of exactly the
+  current sort's arity is a 400 `Invalid pagination token.`,
+  including on an empty scope (upstream #935); they carry positional
+  sort values, so a token replayed under a different sort of the
+  same arity is accepted but paginates on the wrong fields (same
+  caveat as upstream). `{"token": n}`/legacy numeric values still
+  act as raw `from` offsets on POST `/search` bodies (local sugar —
+  `size` clamps to the result window, so the edge yields a short
+  page, not an error); catalog/collection/children listings keep
+  lenient offset tokens
+- `prev` links on item search and item listings are now stateless
+  reverse-direction cursors: the `prev` token carries the page's
+  first sort values plus a reverse marker; the server replays the
+  query with every sort order flipped (`missing` remapped
+  `_last`<->`_first`), reverses the hits back, and emits forward
+  tokens from the page's endpoints, so `prev` chains recurse
+  correctly. Upstream's `prev` needs Redis; this needs nothing
+
 ### Fixed
 
+- Plain `cargo test` runs no longer leak `it-*` test indices — each
+  test binary now sweeps stale indices once at startup, deleting only
+  those whose `it-<nanos>` prefix predates the process (a wholesale
+  `DELETE it-*` would race sibling tests' fresh indices; deletes are
+  chunked under OpenSearch's 4KB initial-line limit). Previously only
+  `make test*` and CI swept, so direct runs accumulated thousands of
+  indices until the cluster choked on shard count
+- Tests against an unreachable OpenSearch now actually skip: the
+  documented `None` path was dead — `Store::connect` only builds a
+  client (no I/O), so tests panicked at `ensure_indices` instead;
+  `test_state_opts` now probes the cluster first
 - `q` on the item listings (`GET /collections/{id}/items` and the
   scoped `/catalogs/{id}/collections/{id}/items`) — the param was
   declared on `ListQuery` but silently dropped;
