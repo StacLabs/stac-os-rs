@@ -243,6 +243,36 @@ async fn test_collection_items_pagination() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(page2["numberReturned"], 1);
+
+    // `prev` is a reverse-direction `search_after` cursor — following
+    // it returns page 1 verbatim (upstream needs Redis for `prev`;
+    // the flipped-sort cursor is stateless).
+    let prev = links_by_rel(&page2, "prev")
+        .pop()
+        .expect("missing prev link");
+    let href = prev["href"].as_str().unwrap();
+    let (s, page1b) = call(
+        &app,
+        "GET",
+        href.strip_prefix("http://test").unwrap_or(href),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(page1b["numberReturned"], 2);
+    let ids: Vec<&str> = page1b["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    let ids1: Vec<&str> = page1["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert_eq!(ids, ids1, "prev page should return page 1 verbatim");
 }
 
 #[tokio::test]

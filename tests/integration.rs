@@ -594,6 +594,12 @@ async fn test_search_pagination() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["numberMatched"], 3);
     assert_eq!(body["numberReturned"], 2);
+    let page1_ids: Vec<String> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str().map(str::to_string))
+        .collect();
     let next = body["links"]
         .as_array()
         .unwrap()
@@ -604,14 +610,258 @@ async fn test_search_pagination() {
     assert!(next["body"]["token"].is_string());
     assert_eq!(next["body"]["limit"], 2); // original search preserved
 
-    // Page 2 via the next link's body: 1 item, prev link back to offset 0
+    // Page 2 via the next link's body: 1 item, prev link back to page 1
     let (s, body) = search(next["body"].clone()).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["numberMatched"], 3);
     assert_eq!(body["numberReturned"], 1);
     let links = body["links"].as_array().unwrap();
-    assert!(links.iter().any(|l| l["rel"] == "prev"));
+    let prev = links
+        .iter()
+        .find(|l| l["rel"] == "prev")
+        .expect("missing prev link");
     assert!(!links.iter().any(|l| l["rel"] == "next"));
+
+    // `prev` is a reverse-direction `search_after` cursor — following
+    // it returns page 1 (upstream needs Redis for this; ours is
+    // stateless). Its `next` link points at page 2 again.
+    let (s, body) = search(prev["body"].clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 3);
+    assert_eq!(body["numberReturned"], 2);
+    let ids: Vec<String> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(ids, page1_ids, "prev page should return page 1 verbatim");
+    let links = body["links"].as_array().unwrap();
+    assert!(links.iter().any(|l| l["rel"] == "next"));
+    assert!(!links.iter().any(|l| l["rel"] == "prev"));
+
+    // GET /search — the next link is a GET href carrying `?token=`.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?limit=2"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let next = body["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .expect("missing next link");
+    let href = next["href"].as_str().unwrap();
+    let (s, page2) = call(
+        &app,
+        "GET",
+        href.strip_prefix("http://test").unwrap_or(href),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(page2["numberReturned"], 1);
+}
+
+#[tokio::test]
+async fn test_search_deep_pagination() {
+    let Some(state) = test_state(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let app = build_app(state.clone());
+    let cat = uniq("it-deep");
+    let col = uniq("it-deep-col");
+
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+
+    // Seed past OpenSearch's `index.max_result_window` (10,000): `from`-
+    // based paging dies there; `search_after` cursors do not.
+    const TOTAL: usize = 10_005;
+    const PAGE: u64 = 5_000;
+    let ops: Vec<(String, Value, bool)> = (0..TOTAL)
+        .map(|i| {
+            let id = format!("it-deep-item-{i:05}");
+            // `_id` mirrors the handler's `item_key` format.
+            (format!("{id}|{col}"), common::item(&id, &col), true)
+        })
+        .collect();
+    let results = state
+        .store
+        .bulk_write(stac_os_rs::store::ITEMS_INDEX, &ops)
+        .await
+        .unwrap();
+    assert!(
+        results.iter().all(|r| r.status == 201),
+        "bulk seed failed: {:?}",
+        results.iter().find(|r| r.status != 201).map(|r| &r.error)
+    );
+
+    // Walk three pages — [5000, 5000, 5] — the last sitting entirely
+    // beyond the 10k result window. Sort is the desc index default
+    // (all datetimes equal → `id` desc tiebreak).
+    let mut seen: Vec<String> = Vec::new();
+    let mut body = json!({"limit": PAGE});
+    for page_no in 0..3 {
+        let (s, resp) = call(
+            &app,
+            "POST",
+            &format!("/catalogs/{cat}/search"),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(resp["numberMatched"], TOTAL as u64);
+        let expected = if page_no < 2 {
+            PAGE
+        } else {
+            (TOTAL % PAGE as usize) as u64
+        };
+        assert_eq!(
+            resp["numberReturned"], expected,
+            "page {page_no} item count"
+        );
+        seen.extend(
+            resp["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["id"].as_str().unwrap().to_string()),
+        );
+        let next = resp["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "next");
+        if page_no < 2 {
+            body = next.expect("missing next link")["body"].clone();
+        } else {
+            assert!(next.is_none(), "last page must not emit next");
+        }
+    }
+    assert_eq!(seen.len(), TOTAL);
+    // No gaps or repeats across the walk — the order is strictly `id`
+    // desc (datetime tie), so the full sequence is reproducible.
+    let expected_order: Vec<String> = (0..TOTAL)
+        .map(|i| format!("it-deep-item-{i:05}"))
+        .rev()
+        .collect();
+    assert_eq!(seen, expected_order, "deep paging must not skip/dup items");
+}
+
+#[tokio::test]
+async fn test_malformed_item_token() {
+    let Some((app, _)) = test_app(true).await else {
+        return;
+    };
+    let cat = uniq("it-tok");
+    let col = uniq("it-tok-col");
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    for i in 0..2 {
+        call(
+            &app,
+            "POST",
+            &format!("/catalogs/{cat}/collections/{col}/items"),
+            Some(common::item(&uniq(&format!("it-tok-item-{i}")), &col)),
+        )
+        .await;
+    }
+
+    // Port of upstream `test_malformed_item_token.py`: every item
+    // route rejects a malformed token with a client error — including
+    // empty (""), non-base64, non-JSON, non-array, and wrong-arity
+    // payloads.
+    use base64::{engine::general_purpose::URL_SAFE, Engine};
+    let enc = |v: Value| URL_SAFE.encode(serde_json::to_vec(&v).unwrap());
+    let malformed = [
+        "".to_string(),
+        "!!!!".to_string(),
+        "a".to_string(),
+        enc(json!("not-a-list")),
+        enc(json!({})),
+        enc(json!([])),
+        enc(json!([1])),
+        enc(json!(["x", "y", "z", "w", "v"])),
+    ];
+    for token in malformed {
+        for (method, path) in [
+            ("GET", format!("/collections/{col}/items?token={token}")),
+            (
+                "GET",
+                format!("/catalogs/{cat}/collections/{col}/items?token={token}"),
+            ),
+        ] {
+            let (s, _) = call(&app, method, &path, None).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{method} {path}");
+        }
+        for body in [
+            json!({"token": token}),
+            json!({"collections": [col], "token": token}),
+        ] {
+            for path in ["/search".to_string(), format!("/catalogs/{cat}/search")] {
+                let (s, _) = call(&app, "POST", &path, Some(body.clone())).await;
+                assert_eq!(s, StatusCode::BAD_REQUEST, "POST {path} {body}");
+            }
+        }
+    }
+
+    // Arity follows the requested sort (upstream
+    // `test_token_length_follows_sortby`): a default-sort token is
+    // invalid under `sortby=datetime`.
+    let (s, first) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let token = first["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .and_then(|l| {
+            l["href"].as_str().and_then(|h| {
+                h.split("token=")
+                    .nth(1)
+                    .map(|t| t.split('&').next().unwrap().to_string())
+            })
+        })
+        .expect("missing next token");
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?limit=1&sortby=datetime&token={token}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // `{"token": null}` and absent token are fine; a numeric token is
+    // legacy offset sugar (local leniency — upstream 400s on it).
+    let (s, _) = call(&app, "POST", "/search", Some(json!({"token": null}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&app, "POST", "/search", Some(json!({"token": 1}))).await;
+    assert_eq!(s, StatusCode::OK);
 }
 
 #[tokio::test]

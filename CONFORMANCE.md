@@ -57,7 +57,7 @@ Legend:
 | Antimeridian-crossing `bbox` | ✅ | Rewritten to a 2-piece `intersects` MultiPolygon |
 | Default limit 10 (`STAC_DEFAULT_ITEM_LIMIT`), cap `MAX_SEARCH_LIMIT` | ✅ | |
 | Response is an ItemCollection with `numberMatched`/`numberReturned` | ✅ | Top-level fields are the current (non-deprecated) form |
-| `next`/`prev` pagination links (GET href-merge; POST body+token) | ✅ | Opaque `token` cursor |
+| `next`/`prev` pagination links (GET href-merge; POST body+token) | ✅ | `search_after` cursor = base64 JSON list of the page edge's sort values (upstream `execute_search`), `limit + 1` lookahead — deep paging past the 10k `max_result_window` works. `prev` is a stateless reverse-direction cursor (upstream needs Redis). Strict arity check vs the requested sort → 400 `Invalid pagination token.` even on empty scope (#935); numeric token/`{offset}` = raw `from` (local sugar) |
 | `q` free-text parameter | ✅ | Comma-separated terms OR'd via a lenient `multi_match` (`best_fields`, `fuzziness=AUTO`) over `FREE_TEXT_FIELDS` (upstream defaults); applies to `/search` and the `/collections/{id}/items` listings — `v1.0.0-rc.1/item-search#free-text` and `v1.0.0-rc.1/ogcapi-features#free-text` advertised |
 
 ## Filter / CQL2 (`item-search#filter`, `features-3` + `cql2` classes)
@@ -159,6 +159,6 @@ link media type, `Location` on create, collections `q` comma-split,
 
 Nothing currently claimed-but-missing. Remaining honest gaps are all
 unclaimed: CQL2 classes we don't advertise (temporal functions,
-property-property, CASEI/ACCENTI, array ops, arithmetic), deep paging
-beyond 10k, and a `/collection-queryables` endpoint (the spec's
-proposed path — ours is per-collection instead).
+property-property, CASEI/ACCENTI, array ops, arithmetic) and a
+`/collection-queryables` endpoint (the spec's proposed path — ours is
+per-collection instead).

@@ -2,7 +2,7 @@
 use super::common::*;
 use super::metadata::items_sortable_fields;
 use crate::api_types::{ItemCollection, Search};
-use crate::store::{COLLECTIONS_INDEX, ITEMS_INDEX};
+use crate::store::{item_sort_clauses, COLLECTIONS_INDEX, ITEMS_INDEX};
 use axum::{
     extract::{Path, Query, RawQuery, State},
     http::{header, StatusCode},
@@ -43,7 +43,7 @@ pub async fn list_collection_items(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    let (mut collection, offset) =
+    let (mut collection, next_vals, prev_vals) =
         items_page(&state, std::slice::from_ref(&collection_id), &query, None).await?;
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
@@ -53,16 +53,14 @@ pub async fn list_collection_items(
     collection
         .links
         .push(link_json(format!("{}/", state.base_url), "root"));
-    if let Some(next) = items_next_link(
+    collection.links.extend(items_page_links(
         &state,
         &format!("/collections/{collection_id}/items"),
         limit,
-        offset,
-        &collection,
+        next_vals.as_deref(),
+        prev_vals.as_deref(),
         pagination_extra(raw.as_deref()).as_deref(),
-    ) {
-        collection.links.push(next);
-    }
+    ));
     Ok(geo_json(collection))
 }
 
@@ -448,7 +446,7 @@ pub async fn list_scoped_items(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    let (mut collection, offset) = items_page(
+    let (mut collection, next_vals, prev_vals) = items_page(
         &state,
         std::slice::from_ref(&collection_id),
         &query,
@@ -466,48 +464,44 @@ pub async fn list_scoped_items(
     collection
         .links
         .push(link_json(format!("{}/", state.base_url), "root"));
-    if let Some(next) = items_next_link(
+    collection.links.extend(items_page_links(
         &state,
         &format!("/catalogs/{catalog_id}/collections/{collection_id}/items"),
         limit,
-        offset,
-        &collection,
+        next_vals.as_deref(),
+        prev_vals.as_deref(),
         pagination_extra(raw.as_deref()).as_deref(),
-    ) {
-        collection.links.push(next);
-    }
+    ));
     Ok(geo_json(collection))
 }
 
 /// Shared items-listing pipeline: `?limit=&token=` + the features-binding
 /// filters (`ids`/`query`/`filter`/`bbox`/`datetime`/`q`) -> paginated search.
 /// `scoped_catalog_id` selects scoped vs canonical item link paths.
-/// Returns the collection and the page offset (for the `next` link).
+/// Returns the collection plus the `next`/`prev` cursor values (the
+/// page endpoints' `search_after` keys) for the page links.
 async fn items_page(
     state: &AppState,
     collections: &[String],
     query: &ListQuery,
     scoped_catalog_id: Option<&str>,
-) -> Result<(ItemCollection, u64), ApiError> {
+) -> Result<
+    (
+        ItemCollection,
+        Option<Vec<serde_json::Value>>,
+        Option<Vec<serde_json::Value>>,
+    ),
+    ApiError,
+> {
     check_filter_crs(query.filter_crs.as_deref())?;
     let (limit, _) = list_window(
         query.limit,
-        query.token.as_deref(),
+        None,
         state.default_item_limit,
         state.max_item_limit,
     )?;
-    let offset = query
-        .token
-        .as_deref()
-        .map(decode_item_token)
-        .transpose()?
-        .unwrap_or(0);
     let mut search = Search::default();
     search.items.limit = Some(limit);
-    search
-        .items
-        .additional_fields
-        .insert("offset".to_string(), json!(offset));
     if let Some(ids) = &query.ids {
         search.ids = ids.split(',').map(|s| s.to_string()).collect();
     }
@@ -601,13 +595,24 @@ async fn items_page(
     if !q_terms.is_empty() {
         extra_filters.push(item_free_text_clause(&q_terms, &state.free_text_fields));
     }
-    let (mut items, matched) = state
+    // Pagination token → `search_after` cursor. Strict arity check
+    // against this request's sort (upstream #935: an invalid token is
+    // a 400 even when the scope is empty).
+    let mut cursor = None;
+    if let Some(t) = query.token.as_deref() {
+        cursor = Some(decode_search_after_token(
+            t,
+            item_sort_clauses(&search.items.sortby).len(),
+        )?);
+    }
+    let (mut items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
             collections,
             &search,
             extra_filters,
             state.default_item_limit,
+            cursor,
         )
         .await?;
     for item in items.iter_mut() {
@@ -633,35 +638,38 @@ async fn items_page(
         ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
     collection.number_matched = Some(matched);
     collection.number_returned = Some(returned);
-    Ok((collection, offset))
+    Ok((collection, next_vals, prev_vals))
 }
 
-/// `next` link for a paged items listing (GET href with limit+token).
-fn items_next_link(
+/// Page links for a paged items listing — GET hrefs carrying the
+/// `search_after` cursor (`next` is a forward token, `prev` a reverse
+/// one — stateless; upstream needs Redis for its `prev`).
+fn items_page_links(
     state: &AppState,
     path: &str,
     limit: u64,
-    offset: u64,
-    collection: &ItemCollection,
+    next_vals: Option<&[serde_json::Value]>,
+    prev_vals: Option<&[serde_json::Value]>,
     extra: Option<&str>,
-) -> Option<Link> {
-    let returned = collection.number_returned.unwrap_or(0);
-    let matched = collection.number_matched.unwrap_or(0);
-    if offset + returned >= matched {
-        return None;
+) -> Vec<Link> {
+    let mut links = Vec::new();
+    for (rel, vals, rev) in [("next", next_vals, false), ("prev", prev_vals, true)] {
+        if let Some(v) = vals {
+            let mut href = format!(
+                "{}{path}?limit={}&token={}",
+                state.base_url,
+                limit,
+                encode_search_after_token(v, rev)
+            );
+            if let Some(e) = extra {
+                href.push_str(e);
+            }
+            let mut link = Link::new(href, rel);
+            link.r#type = Some("application/geo+json".to_string());
+            links.push(link);
+        }
     }
-    let mut href = format!(
-        "{}{path}?limit={}&token={}",
-        state.base_url,
-        limit,
-        encode_item_token(offset + limit)
-    );
-    if let Some(e) = extra {
-        href.push_str(e);
-    }
-    let mut link = Link::new(href, "next");
-    link.r#type = Some("application/geo+json".to_string());
-    Some(link)
+    links
 }
 
 #[utoipa::path(

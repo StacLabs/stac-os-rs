@@ -17,6 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `id, collection, properties.*` (behavior change: terms in arbitrary
   custom properties no longer match unless the field is listed)
 
+### Changed
+
+- Item paging (`/search`, `/catalogs/{id}/search`, both items
+  listings) moved from `from`/`size` offset paging to `search_after`
+  cursors (upstream `execute_search` semantics): the `token` carries
+  the page edge's sort values as a base64 JSON list, a `limit + 1`
+  lookahead detects the next page, and paging past OpenSearch's
+  10k `index.max_result_window` now works. Tokens are strict — any
+  payload that is not a list of exactly the current sort's arity is
+  a 400 `Invalid pagination token.`, including on an empty scope
+  (upstream #935). `{"token": n}`/legacy numeric values still act as
+  raw `from` offsets on POST `/search` bodies (local sugar);
+  catalog/collection/children listings keep lenient offset tokens
+- `prev` links on item search and item listings are now stateless
+  reverse-direction cursors: the `prev` token carries the page's
+  first sort values plus a reverse marker; the server replays the
+  query with every sort order flipped (`missing` remapped
+  `_last`<->`_first`), reverses the hits back, and emits forward
+  tokens from the page's endpoints, so `prev` chains recurse
+  correctly. Upstream's `prev` needs Redis; this needs nothing
+
 ### Fixed
 
 - `q` on the item listings (`GET /collections/{id}/items` and the

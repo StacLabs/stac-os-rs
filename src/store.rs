@@ -1039,20 +1039,37 @@ impl Store {
     }
 
     /// Item search scoped to a set of collections.
-    /// Returns (item docs, total_matched) — sources pass through verbatim
-    /// since ItemCollection supports the fields extension.
+    /// Returns (item docs, total_matched, next-page sort values, prev-page
+    /// sort values) — sources pass through verbatim since ItemCollection
+    /// supports the fields extension.
     /// Translates collections/ids/bbox/intersects/datetime/limit plus
     /// `offset` (unmodeled, arrives via `additional_fields`); `extra_filters`
     /// carries caller-built clauses (`query`/`filter` extensions — see
-    /// [`stacql_clauses`]/[`cql2_clause`]). Cursor/deep pagination remains
-    /// future work.
+    /// [`stacql_clauses`]/[`cql2_clause`]).
+    ///
+    /// Pagination is `search_after` cursor-based (upstream `execute_search`):
+    /// a `limit + 1` lookahead detects the next page, so deep paging never
+    /// hits `index.max_result_window`. `cursor` comes from a client token
+    /// — `Reverse` re-runs the query with every sort direction flipped to
+    /// fetch the preceding page (stateless `prev` link). An explicit
+    /// `offset` still translates to `from` (bounded by the result window);
+    /// a cursor supersedes it.
     pub async fn search_items(
         &self,
         collections: &[String],
         search: &Search,
         extra_filters: Vec<Value>,
         default_limit: u64,
-    ) -> Result<(Vec<Map<String, Value>>, u64), opensearch::Error> {
+        cursor: Option<PageCursor>,
+    ) -> Result<
+        (
+            Vec<Map<String, Value>>,
+            u64,
+            Option<Vec<Value>>,
+            Option<Vec<Value>>,
+        ),
+        opensearch::Error,
+    > {
         let limit = search
             .items
             .limit
@@ -1078,47 +1095,34 @@ impl Store {
             filter.push(datetime_filter(datetime, self.use_datetime));
         }
 
-        // sortby -> OpenSearch `sort` clauses; `_id` is appended as a
-        // tiebreaker so paging is deterministic. Fields are trimmed because
-        // `?sortby=+x` URL-decodes to a leading space; `unmapped_type` keeps
-        // sorting by a not-yet-indexed property from raising a shard error.
-        let mut sort: Vec<Value> = search
-            .items
-            .sortby
-            .iter()
-            .map(|s| {
-                json!({item_field(s.field.trim()): {
-                    "order": s.direction,
-                    "missing": "_last",
-                    "unmapped_type": "keyword"
-                }})
-            })
-            .collect();
-        if sort.is_empty() {
-            // No sortby — upstream's DEFAULT_SORT (mappings.py) is an
-            // index-level segment sort, which orders docs missing the
-            // field last. `_last` replicates that at query time.
-            sort = vec![
-                json!({"properties.datetime": {"order": "desc", "missing": "_last"}}),
-                json!({"properties.start_datetime": {"order": "desc", "missing": "_last"}}),
-                json!({"id": {"order": "desc"}}),
-                json!({"collection": {"order": "desc"}}),
-            ];
-        } else {
-            sort.push(json!({"_id": {"order": "asc"}}));
-        }
+        // sortby -> OpenSearch `sort` clauses (see `item_sort_clauses`);
+        // a Reverse cursor replays the same spec flipped so the page
+        // *before* the anchor arrives reversed, then is flipped back.
+        let mut sort = item_sort_clauses(&search.items.sortby);
+        let search_after = match &cursor {
+            Some(PageCursor::Reverse(vals)) => {
+                sort = reverse_item_sort(&sort);
+                Some(vals.clone())
+            }
+            Some(PageCursor::Forward(vals)) => Some(vals.clone()),
+            None => None,
+        };
 
         filter.extend(extra_filters);
 
         let index = self.idx(ITEMS_INDEX);
+        // `limit + 1` lookahead (upstream `execute_search`): the extra hit
+        // proves a next page exists; it is never returned.
         let mut body = json!({
-            "size": limit,
-            "from": offset,
+            "size": (limit + 1).min(MAX_SEARCH_LIMIT),
             "track_total_hits": true,
-            "query": {"bool": {"filter": filter}}
+            "query": {"bool": {"filter": filter}},
+            "sort": sort,
         });
-        if !sort.is_empty() {
-            body["sort"] = json!(sort);
+        if let Some(vals) = search_after {
+            body["search_after"] = json!(vals);
+        } else if offset > 0 {
+            body["from"] = json!(offset);
         }
         let resp = self
             .client
@@ -1129,13 +1133,38 @@ impl Store {
         resp.error_for_status_code_ref()?;
         let body = resp.json::<Value>().await?;
         let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
-        let items = body["hits"]["hits"]
-            .as_array()
+        let hits: Vec<Value> = body["hits"]["hits"].as_array().cloned().unwrap_or_default();
+        let lookahead = hits.len() > limit as usize;
+        let mut page: Vec<Value> = hits.into_iter().take(limit as usize).collect();
+        // Sort values of a page's edges become the next/prev cursors.
+        // Under a Reverse fetch the hits run backwards — the page's
+        // forward-first item is the last hit and its forward-next page
+        // is the anchor page (always exists); an earlier page exists
+        // iff the reversed lookahead produced an extra hit.
+        let (next_vals, prev_vals) = match cursor {
+            Some(PageCursor::Reverse(_)) => {
+                let next_vals = page.first().and_then(|h| h["sort"].as_array().cloned());
+                page.reverse();
+                let prev_vals = lookahead
+                    .then(|| page.first().and_then(|h| h["sort"].as_array().cloned()))
+                    .flatten();
+                (next_vals, prev_vals)
+            }
+            _ => {
+                let next_vals = lookahead
+                    .then(|| page.last().and_then(|h| h["sort"].as_array().cloned()))
+                    .flatten();
+                let prev_vals = (cursor.is_some() || offset > 0)
+                    .then(|| page.first().and_then(|h| h["sort"].as_array().cloned()))
+                    .flatten();
+                (next_vals, prev_vals)
+            }
+        };
+        let items = page
             .into_iter()
-            .flatten()
             .filter_map(|h| h["_source"].as_object().cloned())
             .collect();
-        Ok((items, total))
+        Ok((items, total, next_vals, prev_vals))
     }
 
     /// Collection search (`/collections-search` and the extended
@@ -1682,6 +1711,85 @@ fn item_field(field: &str) -> String {
         f if f.contains('.') => f.to_string(),
         f => format!("properties.{f}"),
     }
+}
+
+/// Decoded item-search pagination cursor: `search_after` values plus
+/// direction. `Reverse` replays the query with a flipped sort so the
+/// page *before* the anchor arrives backwards and is reversed back —
+/// a stateless `prev` link (upstream needs Redis for its `prev`; a
+/// reversed `search_after` needs nothing).
+pub enum PageCursor {
+    Forward(Vec<Value>),
+    Reverse(Vec<Value>),
+}
+
+/// `sortby` -> OpenSearch `sort` clauses; `_id` is appended as a
+/// tiebreaker so paging is deterministic. Fields are trimmed because
+/// `?sortby=+x` URL-decodes to a leading space; `unmapped_type` keeps
+/// sorting by a not-yet-indexed property from raising a shard error.
+/// No `sortby` -> the index-sort default (datetime/start_datetime/id/
+/// collection desc), which already carries `id` as the unique key.
+/// The clause count is the token arity — decoders reject tokens with
+/// a different count.
+pub(crate) fn item_sort_clauses(sortby: &[crate::api_types::Sortby]) -> Vec<Value> {
+    let mut sort: Vec<Value> = sortby
+        .iter()
+        .map(|s| {
+            json!({item_field(s.field.trim()): {
+                "order": s.direction,
+                "missing": "_last",
+                "unmapped_type": "keyword"
+            }})
+        })
+        .collect();
+    if sort.is_empty() {
+        // No sortby — upstream's DEFAULT_SORT (mappings.py) is an
+        // index-level segment sort, which orders docs missing the
+        // field last. `_last` replicates that at query time.
+        sort = vec![
+            json!({"properties.datetime": {"order": "desc", "missing": "_last"}}),
+            json!({"properties.start_datetime": {"order": "desc", "missing": "_last"}}),
+            json!({"id": {"order": "desc"}}),
+            json!({"collection": {"order": "desc"}}),
+        ];
+    } else {
+        sort.push(json!({"_id": {"order": "asc"}}));
+    }
+    sort
+}
+
+/// Every sort clause flipped (`asc`<->`desc`) with the positional
+/// `missing` symbols swapped (`_last`<->`_first`, and the ES-default
+/// absent -> `_first`) so docs missing a field keep their absolute
+/// position in the mirrored stream. Concrete `missing` values already
+/// mirror naturally — they sort by value in either direction.
+fn reverse_item_sort(sort: &[Value]) -> Vec<Value> {
+    sort.iter()
+        .map(|clause| {
+            let mut clause = clause.clone();
+            if let Some(obj) = clause.as_object_mut() {
+                for spec in obj.values_mut() {
+                    if let Some(s) = spec.as_object_mut() {
+                        // `Map` index-assign panics on missing keys —
+                        // `id`/`collection` clauses carry no `missing`.
+                        let asc = s.get("order").and_then(|o| o.as_str()) == Some("asc");
+                        s.insert("order".to_string(), json!(if asc { "desc" } else { "asc" }));
+                        let missing = match s.get("missing") {
+                            Some(Value::String(m)) if m == "_first" => "_last",
+                            // Concrete values mirror naturally; only the
+                            // positional symbols (and the absent =>
+                            // `_last` default) flip.
+                            Some(Value::String(m)) if m != "_last" => continue,
+                            Some(Value::Number(_)) | Some(Value::Bool(_)) => continue,
+                            _ => "_first",
+                        };
+                        s.insert("missing".to_string(), json!(missing));
+                    }
+                }
+            }
+            clause
+        })
+        .collect()
 }
 
 /// Exact-match field for term/terms/wildcard clauses: dynamic string
