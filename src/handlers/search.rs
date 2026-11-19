@@ -78,10 +78,11 @@ async fn run_scoped_search(
         return Err(ApiError::NotFound(scope_id.to_string()));
     }
 
-    // Pagination token → `search_after` cursor — decoded before the
-    // scope check so a malformed token 400s even on an empty scope
-    // (upstream #935 semantics). A numeric token is legacy leniency:
-    // treated as a raw offset (`from`).
+    // Pagination token → `search_after` cursor — decoded before
+    // extension parsing and the empty-scope short-circuit, so a
+    // malformed token 400s even on an empty scope (upstream #935
+    // semantics). A numeric token is legacy leniency: treated as a
+    // raw offset (`from`).
     let mut cursor = None;
     if let Some(t) = search.items.additional_fields.get("token").cloned() {
         if !t.is_null() {
@@ -333,7 +334,6 @@ async fn run_scoped_search(
     // `prev` is a reverse-direction `search_after` token — upstream
     // needs Redis to reconstruct it; the flipped sort does it statelessly.
     let get_uri = req.as_ref().filter(|(_, is_get)| *is_get).map(|(u, _)| u);
-    let base = &state.base_url;
     let self_href = match &req {
         Some((u, _)) => format!("{base}{u}"),
         None => {
@@ -376,7 +376,10 @@ fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, token: &str) -> L
     let (path, query) = pq.split_once('?').unwrap_or((pq, ""));
     let kept: Vec<&str> = query
         .split('&')
-        .filter(|p| !p.is_empty() && !p.starts_with("token="))
+        .filter(|p| {
+            let k = p.split('=').next().unwrap_or("");
+            !k.is_empty() && k != "token"
+        })
         .collect();
     let mut merged = path.to_string();
     merged.push('?');
@@ -386,7 +389,7 @@ fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, token: &str) -> L
     }
     merged.push_str("token=");
     merged.push_str(token);
-    let mut link = Link::new(format!("{base}{merged}",), rel);
+    let mut link = Link::new(format!("{base}{merged}"), rel);
     link.method = Some("GET".to_string());
     link.r#type = Some("application/json".to_string());
     link

@@ -1049,11 +1049,13 @@ impl Store {
     ///
     /// Pagination is `search_after` cursor-based (upstream `execute_search`):
     /// a `limit + 1` lookahead detects the next page, so deep paging never
-    /// hits `index.max_result_window`. `cursor` comes from a client token
-    /// — `Reverse` re-runs the query with every sort direction flipped to
-    /// fetch the preceding page (stateless `prev` link). An explicit
-    /// `offset` still translates to `from` (bounded by the result window);
-    /// a cursor supersedes it.
+    /// hits `index.max_result_window` — a full page stands in when the
+    /// lookahead slot doesn't fit the window (`limit` at the cap or a
+    /// window-edge `from`). `cursor` comes from a client token — `Reverse`
+    /// re-runs the query with every sort direction flipped to fetch the
+    /// preceding page (stateless `prev` link). An explicit `offset` still
+    /// translates to `from` with `size` clamped to fit the window; a
+    /// cursor supersedes it.
     pub async fn search_items(
         &self,
         collections: &[String],
@@ -1112,9 +1114,15 @@ impl Store {
 
         let index = self.idx(ITEMS_INDEX);
         // `limit + 1` lookahead (upstream `execute_search`): the extra hit
-        // proves a next page exists; it is never returned.
+        // proves a next page exists; it is never returned. `from`+`size`
+        // must fit `index.max_result_window`, so a `from` request clamps
+        // `size` at the window edge — a short final page, not an error.
+        let mut size = (limit + 1).min(MAX_SEARCH_LIMIT);
+        if search_after.is_none() && offset > 0 {
+            size = size.min(MAX_SEARCH_LIMIT.saturating_sub(offset));
+        }
         let mut body = json!({
-            "size": (limit + 1).min(MAX_SEARCH_LIMIT),
+            "size": size,
             "track_total_hits": true,
             "query": {"bool": {"filter": filter}},
             "sort": sort,
@@ -1134,7 +1142,12 @@ impl Store {
         let body = resp.json::<Value>().await?;
         let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
         let hits: Vec<Value> = body["hits"]["hits"].as_array().cloned().unwrap_or_default();
-        let lookahead = hits.len() > limit as usize;
+        // An extra hit proves another page; when the lookahead slot
+        // didn't fit (`limit` at the cap or `from` clamped) a full page
+        // stands in — a boundary-exact final page can then emit a `next`
+        // link that resolves to an empty page.
+        let lookahead =
+            hits.len() > limit as usize || (size <= limit && hits.len() == size as usize);
         let mut page: Vec<Value> = hits.into_iter().take(limit as usize).collect();
         // Sort values of a page's edges become the next/prev cursors.
         // Under a Reverse fetch the hits run backwards — the page's

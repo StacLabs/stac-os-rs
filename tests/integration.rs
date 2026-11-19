@@ -758,6 +758,62 @@ async fn test_search_deep_pagination() {
         .rev()
         .collect();
     assert_eq!(seen, expected_order, "deep paging must not skip/dup items");
+
+    // `limit` at MAX_SEARCH_LIMIT leaves no room for the lookahead
+    // hit — a full page stands in, so `next` still appears and the
+    // tail resolves past the 10k window.
+    let (s, resp) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(json!({"limit": stac_os_rs::store::MAX_SEARCH_LIMIT})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(resp["numberReturned"], stac_os_rs::store::MAX_SEARCH_LIMIT);
+    let next = resp["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .expect("max-limit page must emit next");
+    let (s, resp) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(next["body"].clone()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(resp["numberReturned"], (TOTAL % 10_000) as u64);
+
+    // A numeric token is a raw `from` offset: `size` clamps at the
+    // window edge (a short page, not an error) and the `next` link
+    // escapes the window as a `search_after` cursor.
+    let (s, resp) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(json!({"limit": 5, "token": 9998})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(resp["numberReturned"], 2); // only 2 docs fit the window
+    let next = resp["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .expect("window-clamped page must emit next");
+    let (s, resp) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(next["body"].clone()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(resp["numberReturned"], 5);
 }
 
 #[tokio::test]
