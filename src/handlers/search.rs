@@ -4,7 +4,7 @@ use crate::api_types::{GetSearch, ItemCollection, Search};
 use crate::store::{item_sort_clauses, CATALOGS_INDEX, ROOT_CATALOG_ID};
 use axum::{
     extract::{Path, Query, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 use stac::{Bbox, Link};
@@ -20,7 +20,7 @@ async fn run_scoped_search(
     scope_id: &str,
     mut search: Search,
     req: Option<(axum::http::Uri, bool)>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let empty = || {
         let mut c =
             ItemCollection::new(Vec::new()).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -131,7 +131,7 @@ async fn run_scoped_search(
                     "Requested collections are outside the scope of this catalog.".to_string(),
                 ));
             }
-            return Ok(geo_json(empty()?));
+            return Ok(geo_json(empty()?).into_response());
         }
     } else {
         search.collections = allowed_collections.iter().cloned().collect();
@@ -285,10 +285,10 @@ async fn run_scoped_search(
     // nothing) short-circuits — after parsing, so malformed extension
     // params still surface their 400 (#935 semantics).
     if search.collections.is_empty() {
-        return Ok(geo_json(empty()?));
+        return Ok(geo_json(empty()?).into_response());
     }
 
-    let (mut items, matched, next_vals, prev_vals) = state
+    let (items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
             &search.collections,
@@ -300,33 +300,12 @@ async fn run_scoped_search(
         .await?;
     let base = &state.base_url;
     let link_scope = (scope_id != ROOT_CATALOG_ID).then_some(scope_id);
-    for item in items.iter_mut() {
-        let item_id = item["id"].as_str().unwrap_or_default().to_string();
-        if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            let mut doc = serde_json::Value::Object(std::mem::take(item));
-            merge_doc_links(
-                &mut doc,
-                item_links(state, &item_id, &col, link_scope),
-                base,
-            );
-            *item = doc.as_object().unwrap().clone();
-        }
-    }
-    for item in items.iter_mut() {
-        strip_excluded_item_fields(state, item);
-    }
-    // Fields extension runs last — it strips generated links too.
-    if let Some(fields) = &search.items.fields {
-        for item in items.iter_mut() {
-            crate::store::filter_fields(item, &fields.include, &fields.exclude);
-        }
-    }
-    let returned = items.len() as u64;
-    let mut collection =
-        ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
-    collection.number_matched = Some(matched);
-    collection.number_returned = Some(returned);
-    collection.links.push(link_json(format!("{base}/"), "root"));
+    // `_source` arrives as raw JSON — `features_from_hits` splices
+    // `links` in textually when it can, else merges stored user links
+    // alongside the generated set.
+    let features = features_from_hits(state, items, search.items.fields.as_ref(), link_scope)?;
+    let returned = features.len() as u64;
+    let mut links = vec![link_json(format!("{base}/"), "root")];
 
     // 4. Pagination links — upstream PagingLinks: GET merges the request
     // URL with a `token` query param (`method: GET`); POST carries the
@@ -348,22 +327,29 @@ async fn run_scoped_search(
         Some((u, _)) => format!("{base}{}", u.path()),
         None => self_href.clone(),
     };
-    collection.links.push(link_json(self_href, "self"));
+    links.push(link_json(self_href, "self"));
     if let Some(vals) = next_vals {
         let token = encode_search_after_token(&vals, false);
-        collection.links.push(match get_uri {
+        links.push(match get_uri {
             Some(u) => page_link_get("next", base, u, &token),
             None => page_link("next", &post_href, &search, &token),
         });
     }
     if let Some(vals) = prev_vals {
         let token = encode_search_after_token(&vals, true);
-        collection.links.push(match get_uri {
+        links.push(match get_uri {
             Some(u) => page_link_get("prev", base, u, &token),
             None => page_link("prev", &post_href, &search, &token),
         });
     }
-    Ok(geo_json(collection))
+    Ok(geo_json(RawItemCollection {
+        type_: "FeatureCollection",
+        features,
+        links,
+        number_matched: Some(matched),
+        number_returned: Some(returned),
+    })
+    .into_response())
 }
 
 /// GET-side pagination link: rel + href (request URL with `token`

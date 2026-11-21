@@ -541,6 +541,128 @@ pub(crate) fn merge_doc_links(doc: &mut serde_json::Value, generated: Vec<Link>,
     doc["links"] = json!(out);
 }
 
+/// `ItemCollection` shape for raw-passthrough read paths: `features`
+/// are `RawValue` slices (each already carrying its `links`)
+/// serialized verbatim — no DOM round-trip per item.
+#[derive(serde::Serialize)]
+pub(crate) struct RawItemCollection {
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub features: Vec<Box<serde_json::value::RawValue>>,
+    pub links: Vec<Link>,
+    #[serde(rename = "numberMatched", skip_serializing_if = "Option::is_none")]
+    pub number_matched: Option<u64>,
+    #[serde(rename = "numberReturned", skip_serializing_if = "Option::is_none")]
+    pub number_returned: Option<u64>,
+}
+
+/// Top-level member map of a JSON object with verbatim value slices —
+/// one structural scan, no DOM. `None` for non-objects.
+pub(crate) fn item_members(src: &str) -> Option<HashMap<String, Box<serde_json::value::RawValue>>> {
+    serde_json::from_str(src).ok()
+}
+
+/// Splice `"links"` in as the last member of a top-level JSON object —
+/// the same position `Map::insert` appends at. `None` if `src` is not
+/// an object.
+pub(crate) fn splice_links(
+    src: &str,
+    links_json: &str,
+) -> Option<Box<serde_json::value::RawValue>> {
+    let head = src.trim_end().strip_suffix('}')?.trim_end();
+    // An empty object gets no separator comma.
+    let sep = if head.ends_with('{') { "" } else { "," };
+    serde_json::value::RawValue::from_string(format!("{head}{sep}\"links\":{links_json}}}")).ok()
+}
+
+/// `links` splice without a DOM parse: the doc's top-level members are
+/// scanned as raw slices (`item_members`), and a doc with no stored
+/// `links` gets the generated array appended — the same slot
+/// `Map::insert` uses. `None` means take the map path — non-object
+/// source, a stored `links` member to merge, or no `collection`
+/// (nothing to link into).
+pub(crate) fn splice_item_links(
+    state: &AppState,
+    src: &str,
+    link_scope: Option<&str>,
+) -> Result<Option<Box<serde_json::value::RawValue>>, ApiError> {
+    // A stored `links` member almost always surfaces as a `"links"`
+    // substring — bail before the member scan so merge-path docs pay a
+    // single DOM parse. A nested `links` member or string is a false
+    // positive that only forfeits the splice; a member name escaped as
+    // `"\u006cinks"` slips past the gate but is caught by `contains_key`.
+    if src.contains("\"links\"") {
+        return Ok(None);
+    }
+    let Some(members) = item_members(src) else {
+        return Ok(None);
+    };
+    if members.contains_key("links") {
+        return Ok(None);
+    }
+    let get_str =
+        |k: &str| -> Option<String> { serde_json::from_str::<String>(members.get(k)?.get()).ok() };
+    let Some(collection) = get_str("collection") else {
+        return Ok(None);
+    };
+    let id = get_str("id").unwrap_or_default();
+    let links = serde_json::to_string(&item_links(state, &id, &collection, link_scope))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(splice_links(src, &links))
+}
+
+/// Feature list assembly shared by `/search` and the items listings:
+/// `_source` arrives as raw JSON, so with no `fields` filter and no
+/// exclusions the generated `links` splice in textually
+/// (`splice_item_links`) and the doc never pays a DOM parse.
+/// Everything else takes the map path — stored links merged,
+/// `EXCLUDED_FROM_ITEMS` stripped, then the fields extension last (it
+/// strips generated links too). Non-object hits are dropped.
+pub(crate) fn features_from_hits(
+    state: &AppState,
+    items: Vec<Box<serde_json::value::RawValue>>,
+    fields: Option<&crate::api_types::Fields>,
+    link_scope: Option<&str>,
+) -> Result<Vec<Box<serde_json::value::RawValue>>, ApiError> {
+    let fast = fields.is_none() && state.excluded_item_fields.is_empty();
+    let base = &state.base_url;
+    let mut features = Vec::with_capacity(items.len());
+    for raw in items {
+        let src = raw.get();
+        if fast {
+            if let Some(out) = splice_item_links(state, src, link_scope)? {
+                features.push(out);
+                continue;
+            }
+        }
+        let Ok(mut item) = serde_json::from_str::<serde_json::Map<String, Value>>(src) else {
+            continue;
+        };
+        let item_id = item["id"].as_str().unwrap_or_default().to_string();
+        if let Some(col) = item["collection"].as_str().map(str::to_owned) {
+            let mut doc = Value::Object(std::mem::take(&mut item));
+            merge_doc_links(
+                &mut doc,
+                item_links(state, &item_id, &col, link_scope),
+                base,
+            );
+            item = doc.as_object().unwrap().clone();
+        }
+        strip_excluded_item_fields(state, &mut item);
+        // Fields extension runs last — it strips generated links too.
+        if let Some(fields) = fields {
+            crate::store::filter_fields(&mut item, &fields.include, &fields.exclude);
+        }
+        features.push(
+            serde_json::value::RawValue::from_string(
+                serde_json::to_string(&item).map_err(|e| ApiError::Internal(e.to_string()))?,
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
+    }
+    Ok(features)
+}
+
 /// STAC API - Children v1.0.0 invariants for the `/children` response:
 /// the response `links` must include `root`, `parent`, and `self`, and
 /// every child must carry a `self` link to its canonical location.
