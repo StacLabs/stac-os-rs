@@ -386,53 +386,6 @@ async fn run_scoped_search(
     .into_response())
 }
 
-/// `ItemCollection` shape for the search hot path: `features` are
-/// `RawValue` slices (each already carrying its `links`) serialized
-/// verbatim — no DOM round-trip per item.
-#[derive(serde::Serialize)]
-struct RawItemCollection {
-    #[serde(rename = "type")]
-    type_: &'static str,
-    features: Vec<Box<RawValue>>,
-    links: Vec<Link>,
-    #[serde(rename = "numberMatched", skip_serializing_if = "Option::is_none")]
-    number_matched: Option<u64>,
-    #[serde(rename = "numberReturned", skip_serializing_if = "Option::is_none")]
-    number_returned: Option<u64>,
-}
-
-/// `links` splice without a DOM parse: the doc decodes as a top-level
-/// key map whose values stay raw slices, so `contains_key("links")`
-/// tells "no stored links" from "stored links to merge" (including a
-/// stored `null`, which `Option` would flatten away). A link-less doc
-/// gets the generated array inserted right after the opening brace.
-/// `None` means take the map path — non-object source, stored `links`,
-/// or no `collection` (nothing to link into).
-fn splice_item_links(
-    state: &AppState,
-    src: &str,
-    link_scope: Option<&str>,
-) -> Result<Option<Box<RawValue>>, ApiError> {
-    let Ok(members) = serde_json::from_str::<std::collections::HashMap<String, Box<RawValue>>>(src)
-    else {
-        return Ok(None);
-    };
-    if members.contains_key("links") {
-        return Ok(None);
-    }
-    let get_str =
-        |k: &str| -> Option<String> { serde_json::from_str::<String>(members.get(k)?.get()).ok() };
-    let (Some(collection), Some(rest)) = (get_str("collection"), src.strip_prefix('{')) else {
-        return Ok(None);
-    };
-    let id = get_str("id").unwrap_or_default();
-    let links = serde_json::to_string(&item_links(state, &id, &collection, link_scope))
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    RawValue::from_string(format!("{{\"links\":{links},{rest}"))
-        .map(Some)
-        .map_err(|e| ApiError::Internal(e.to_string()))
-}
-
 /// GET-side pagination link: rel + href (request URL with `token`
 /// merged in) + `method: GET` — upstream `PagingLinks.link_next`.
 fn page_link_get(rel: &str, base: &str, uri: &axum::http::Uri, token: &str) -> Link {

@@ -1054,13 +1054,13 @@ async fn test_transactions_disabled_405s() {
     assert_eq!(s, StatusCode::OK);
 }
 
-/// `/search` emits `links` two ways: docs with no stored `links` take
-/// the RawValue splice fast-path, docs with stored user links take the
-/// DOM merge path. Both must carry the generated rels; the stored user
-/// link must survive the merge; and the `fields` filter must still
-/// strip links via the DOM path.
+/// Item read endpoints emit `links` two ways: docs with no stored
+/// `links` take the RawValue splice fast-path, docs with stored user
+/// links take the DOM path. Both `/search` and the items listings
+/// merge stored links — user rels survive alongside the generated
+/// set; `fields` still strips links via the DOM path.
 #[tokio::test]
-async fn test_search_item_links_fast_and_dom() {
+async fn test_item_links_fast_and_dom_paths() {
     use stac_os_rs::store::ITEMS_INDEX;
     let Some(state) = test_state(true).await else {
         eprintln!("skipping: OpenSearch unreachable");
@@ -1137,6 +1137,56 @@ async fn test_search_item_links_fast_and_dom() {
         "POST",
         &format!("/catalogs/{cat}/search"),
         Some(json!({"collections": [col], "fields": {"include": ["id"]}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    for f in body["features"].as_array().unwrap() {
+        assert!(f.get("id").is_some());
+        assert!(f.get("links").is_none());
+    }
+
+    // Items listing — same split and same merge: the stored `license`
+    // rel survives alongside the generated links.
+    let (s, body) = call(&app, "GET", &format!("/collections/{col}/items"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let feats = body["features"].as_array().unwrap();
+    let plain = feats.iter().find(|f| f["id"] == plain_id).unwrap();
+    let linked = feats.iter().find(|f| f["id"] == linked_id).unwrap();
+    for f in [plain, linked] {
+        for rel in ["self", "parent", "collection", "root"] {
+            assert!(rels(f).iter().any(|r| r == rel), "missing rel {rel} on {f}");
+        }
+    }
+    assert!(rels(linked).iter().any(|r| r == "license"));
+
+    // Catalog-scoped listing — splice path must produce scoped hrefs.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let feats = body["features"].as_array().unwrap();
+    let plain = feats.iter().find(|f| f["id"] == plain_id).unwrap();
+    let self_href = plain["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "self")
+        .unwrap()["href"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(self_href.contains(&format!("/catalogs/{cat}/")));
+
+    // `?fields=` on the listing — DOM path, links stripped.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/collections/{col}/items?fields=id"),
+        None,
     )
     .await;
     assert_eq!(s, StatusCode::OK);

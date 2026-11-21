@@ -1,7 +1,7 @@
 // src/handlers/items.rs
 use super::common::*;
 use super::metadata::items_sortable_fields;
-use crate::api_types::{ItemCollection, Search};
+use crate::api_types::Search;
 use crate::store::{item_sort_clauses, COLLECTIONS_INDEX, ITEMS_INDEX};
 use axum::{
     extract::{Path, Query, RawQuery, State},
@@ -10,7 +10,7 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, value::RawValue};
 use stac::{Bbox, Item, Link};
 use std::sync::Arc;
 
@@ -487,7 +487,7 @@ async fn items_page(
     scoped_catalog_id: Option<&str>,
 ) -> Result<
     (
-        ItemCollection,
+        RawItemCollection,
         Option<Vec<serde_json::Value>>,
         Option<Vec<serde_json::Value>>,
     ),
@@ -615,36 +615,56 @@ async fn items_page(
             cursor,
         )
         .await?;
-    // `search_items` returns `_source` as raw JSON — the listing
-    // mutates every doc (links injection, fields filter), so each
-    // slice is parsed into a map here.
-    let mut items: Vec<serde_json::Map<String, serde_json::Value>> = items
-        .into_iter()
-        .filter_map(|r| serde_json::from_str(r.get()).ok())
-        .collect();
-    for item in items.iter_mut() {
+    // `_source` arrives as raw JSON — with no `fields` filter or
+    // exclusions the generated `links` splice in textually. A doc
+    // carrying a stored `links` member takes the map path where
+    // `merge_doc_links` keeps user rels alongside the generated set
+    // (same merge as `/search`).
+    let fast = search.items.fields.is_none() && state.excluded_item_fields.is_empty();
+    let base = &state.base_url;
+    let mut features: Vec<Box<RawValue>> = Vec::with_capacity(items.len());
+    for raw in items {
+        let src = raw.get();
+        if fast {
+            if let Some(out) = splice_item_links(state, src, scoped_catalog_id)? {
+                features.push(out);
+                continue;
+            }
+        }
+        let Ok(mut item) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(src)
+        else {
+            continue;
+        };
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
         if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            item.insert(
-                "links".to_string(),
-                json!(item_links(state, &item_id, &col, scoped_catalog_id)),
+            let mut doc = serde_json::Value::Object(std::mem::take(&mut item));
+            merge_doc_links(
+                &mut doc,
+                item_links(state, &item_id, &col, scoped_catalog_id),
+                base,
             );
+            item = doc.as_object().unwrap().clone();
         }
-    }
-    for item in items.iter_mut() {
-        strip_excluded_item_fields(state, item);
-    }
-    // Fields extension runs last — it strips generated links too.
-    if let Some(fields) = &search.items.fields {
-        for item in items.iter_mut() {
-            crate::store::filter_fields(item, &fields.include, &fields.exclude);
+        strip_excluded_item_fields(state, &mut item);
+        // Fields extension runs last — it strips generated links too.
+        if let Some(fields) = &search.items.fields {
+            crate::store::filter_fields(&mut item, &fields.include, &fields.exclude);
         }
+        features.push(
+            RawValue::from_string(
+                serde_json::to_string(&item).map_err(|e| ApiError::Internal(e.to_string()))?,
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
     }
-    let returned = items.len() as u64;
-    let mut collection =
-        ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
-    collection.number_matched = Some(matched);
-    collection.number_returned = Some(returned);
+    let returned = features.len() as u64;
+    let collection = RawItemCollection {
+        type_: "FeatureCollection",
+        features,
+        links: Vec::new(),
+        number_matched: Some(matched),
+        number_returned: Some(returned),
+    };
     Ok((collection, next_vals, prev_vals))
 }
 
