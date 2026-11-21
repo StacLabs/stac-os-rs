@@ -10,7 +10,7 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
-use serde_json::{json, value::RawValue};
+use serde_json::json;
 use stac::{Bbox, Item, Link};
 use std::sync::Arc;
 
@@ -43,9 +43,8 @@ pub async fn list_collection_items(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    let (mut collection, next_vals, prev_vals) =
+    let (mut collection, limit, next_vals, prev_vals) =
         items_page(&state, std::slice::from_ref(&collection_id), &query, None).await?;
-    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
         format!("{}/collections/{collection_id}/items", state.base_url),
         "self",
@@ -446,14 +445,13 @@ pub async fn list_scoped_items(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    let (mut collection, next_vals, prev_vals) = items_page(
+    let (mut collection, limit, next_vals, prev_vals) = items_page(
         &state,
         std::slice::from_ref(&collection_id),
         &query,
         Some(&catalog_id),
     )
     .await?;
-    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
         format!(
             "{}/catalogs/{catalog_id}/collections/{collection_id}/items",
@@ -478,8 +476,10 @@ pub async fn list_scoped_items(
 /// Shared items-listing pipeline: `?limit=&token=` + the features-binding
 /// filters (`ids`/`query`/`filter`/`bbox`/`datetime`/`q`) -> paginated search.
 /// `scoped_catalog_id` selects scoped vs canonical item link paths.
-/// Returns the collection plus the `next`/`prev` cursor values (the
-/// page endpoints' `search_after` keys) for the page links.
+/// Returns the collection, the effective page size (default applied and
+/// max cap enforced — the `limit=` the page links must advertise), and
+/// the `next`/`prev` cursor values (the page endpoints' `search_after`
+/// keys) for the page links.
 async fn items_page(
     state: &AppState,
     collections: &[String],
@@ -488,6 +488,7 @@ async fn items_page(
 ) -> Result<
     (
         RawItemCollection,
+        u64,
         Option<Vec<serde_json::Value>>,
         Option<Vec<serde_json::Value>>,
     ),
@@ -615,48 +616,10 @@ async fn items_page(
             cursor,
         )
         .await?;
-    // `_source` arrives as raw JSON — with no `fields` filter or
-    // exclusions the generated `links` splice in textually. A doc
-    // carrying a stored `links` member takes the map path where
-    // `merge_doc_links` keeps user rels alongside the generated set
-    // (same merge as `/search`).
-    let fast = search.items.fields.is_none() && state.excluded_item_fields.is_empty();
-    let base = &state.base_url;
-    let mut features: Vec<Box<RawValue>> = Vec::with_capacity(items.len());
-    for raw in items {
-        let src = raw.get();
-        if fast {
-            if let Some(out) = splice_item_links(state, src, scoped_catalog_id)? {
-                features.push(out);
-                continue;
-            }
-        }
-        let Ok(mut item) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(src)
-        else {
-            continue;
-        };
-        let item_id = item["id"].as_str().unwrap_or_default().to_string();
-        if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            let mut doc = serde_json::Value::Object(std::mem::take(&mut item));
-            merge_doc_links(
-                &mut doc,
-                item_links(state, &item_id, &col, scoped_catalog_id),
-                base,
-            );
-            item = doc.as_object().unwrap().clone();
-        }
-        strip_excluded_item_fields(state, &mut item);
-        // Fields extension runs last — it strips generated links too.
-        if let Some(fields) = &search.items.fields {
-            crate::store::filter_fields(&mut item, &fields.include, &fields.exclude);
-        }
-        features.push(
-            RawValue::from_string(
-                serde_json::to_string(&item).map_err(|e| ApiError::Internal(e.to_string()))?,
-            )
-            .map_err(|e| ApiError::Internal(e.to_string()))?,
-        );
-    }
+    // `_source` arrives as raw JSON — `features_from_hits` splices
+    // `links` in textually when it can, else merges stored user links
+    // alongside the generated set (same merge as `/search`).
+    let features = features_from_hits(state, items, search.items.fields.as_ref(), scoped_catalog_id)?;
     let returned = features.len() as u64;
     let collection = RawItemCollection {
         type_: "FeatureCollection",
@@ -665,7 +628,7 @@ async fn items_page(
         number_matched: Some(matched),
         number_returned: Some(returned),
     };
-    Ok((collection, next_vals, prev_vals))
+    Ok((collection, limit, next_vals, prev_vals))
 }
 
 /// Page links for a paged items listing — GET hrefs carrying the

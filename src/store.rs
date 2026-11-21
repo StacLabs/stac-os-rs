@@ -1753,9 +1753,27 @@ struct HitsEnvelope {
     hits: Vec<ItemHit>,
 }
 
-#[derive(Deserialize, Default)]
+/// `hits.total` — OpenSearch emits `{"value": N, "relation": "eq|gte"}`,
+/// but `rest_total_hits_as_int` (and ES 6.x backends) return a bare
+/// integer. Both deserialize to the count.
+#[derive(Default)]
 struct HitsTotal {
     value: u64,
+}
+
+impl<'de> Deserialize<'de> for HitsTotal {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Object { value: u64 },
+            Int(u64),
+        }
+        let value = match Repr::deserialize(d)? {
+            Repr::Object { value } | Repr::Int(value) => value,
+        };
+        Ok(Self { value })
+    }
 }
 
 #[derive(Deserialize)]
@@ -2823,6 +2841,19 @@ mod tests {
         let mut parents = vec!["a".to_string(), "b".to_string()];
         apply_unlink(&mut parents, "a");
         assert_eq!(parents, vec!["b"]);
+    }
+
+    #[test]
+    fn test_search_envelope_total_object_and_int() {
+        let env: SearchEnvelope = serde_json::from_str(
+            r#"{"hits": {"total": {"value": 7, "relation": "eq"}, "hits": []}}"#,
+        )
+        .unwrap();
+        assert_eq!(env.hits.total.value, 7);
+        // `rest_total_hits_as_int` / ES 6.x integer form.
+        let env: SearchEnvelope =
+            serde_json::from_str(r#"{"hits": {"total": 7, "hits": []}}"#).unwrap();
+        assert_eq!(env.hits.total.value, 7);
     }
 
     #[test]

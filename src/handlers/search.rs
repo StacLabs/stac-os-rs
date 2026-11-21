@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
 };
-use serde_json::{json, value::RawValue, Value};
+use serde_json::json;
 use stac::{Bbox, Link};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -300,44 +300,10 @@ async fn run_scoped_search(
         .await?;
     let base = &state.base_url;
     let link_scope = (scope_id != ROOT_CATALOG_ID).then_some(scope_id);
-    // `_source` arrives as raw JSON — the fast path splices `links` in
-    // textually and never builds a DOM. Stored `links` to merge, the
-    // `fields` filter, or field exclusions drop to the map path.
-    let fast = search.items.fields.is_none() && state.excluded_item_fields.is_empty();
-    let mut features: Vec<Box<RawValue>> = Vec::with_capacity(items.len());
-    for raw in items {
-        let src = raw.get();
-        if fast {
-            if let Some(out) = splice_item_links(state, src, link_scope)? {
-                features.push(out);
-                continue;
-            }
-        }
-        let Ok(mut item) = serde_json::from_str::<serde_json::Map<String, Value>>(src) else {
-            continue;
-        };
-        let item_id = item["id"].as_str().unwrap_or_default().to_string();
-        if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            let mut doc = serde_json::Value::Object(std::mem::take(&mut item));
-            merge_doc_links(
-                &mut doc,
-                item_links(state, &item_id, &col, link_scope),
-                base,
-            );
-            item = doc.as_object().unwrap().clone();
-        }
-        strip_excluded_item_fields(state, &mut item);
-        // Fields extension runs last — it strips generated links too.
-        if let Some(fields) = &search.items.fields {
-            crate::store::filter_fields(&mut item, &fields.include, &fields.exclude);
-        }
-        features.push(
-            RawValue::from_string(
-                serde_json::to_string(&item).map_err(|e| ApiError::Internal(e.to_string()))?,
-            )
-            .map_err(|e| ApiError::Internal(e.to_string()))?,
-        );
-    }
+    // `_source` arrives as raw JSON — `features_from_hits` splices
+    // `links` in textually when it can, else merges stored user links
+    // alongside the generated set.
+    let features = features_from_hits(state, items, search.items.fields.as_ref(), link_scope)?;
     let returned = features.len() as u64;
     let mut links = vec![link_json(format!("{base}/"), "root")];
 
