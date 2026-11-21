@@ -619,7 +619,12 @@ async fn items_page(
     // `_source` arrives as raw JSON — `features_from_hits` splices
     // `links` in textually when it can, else merges stored user links
     // alongside the generated set (same merge as `/search`).
-    let features = features_from_hits(state, items, search.items.fields.as_ref(), scoped_catalog_id)?;
+    let features = features_from_hits(
+        state,
+        items,
+        search.items.fields.as_ref(),
+        scoped_catalog_id,
+    )?;
     let returned = features.len() as u64;
     let collection = RawItemCollection {
         type_: "FeatureCollection",
