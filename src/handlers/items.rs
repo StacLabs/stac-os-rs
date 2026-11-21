@@ -605,7 +605,7 @@ async fn items_page(
             item_sort_clauses(&search.items.sortby).len(),
         )?);
     }
-    let (mut items, matched, next_vals, prev_vals) = state
+    let (items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
             collections,
@@ -615,6 +615,13 @@ async fn items_page(
             cursor,
         )
         .await?;
+    // `search_items` returns `_source` as raw JSON — the listing
+    // mutates every doc (links injection, fields filter), so each
+    // slice is parsed into a map here.
+    let mut items: Vec<serde_json::Map<String, serde_json::Value>> = items
+        .into_iter()
+        .filter_map(|r| serde_json::from_str(r.get()).ok())
+        .collect();
     for item in items.iter_mut() {
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
         if let Some(col) = item["collection"].as_str().map(str::to_owned) {

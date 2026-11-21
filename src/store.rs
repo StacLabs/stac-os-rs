@@ -13,7 +13,7 @@ use opensearch::{
     OpenSearch, SearchParts,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, value::RawValue, Map, Value};
 use stac::Bbox;
 use std::collections::{HashMap, HashSet};
 
@@ -1039,9 +1039,11 @@ impl Store {
     }
 
     /// Item search scoped to a set of collections.
-    /// Returns (item docs, total_matched, next-page sort values, prev-page
-    /// sort values) — sources pass through verbatim since ItemCollection
-    /// supports the fields extension.
+    /// Returns (item docs as raw JSON, total_matched, next-page sort
+    /// values, prev-page sort values) — sources come back as `RawValue`
+    /// slices so `geometry`/`properties`/`assets` never pay a DOM parse
+    /// on read paths that can splice instead of mutate (see
+    /// `splice_item_links`).
     /// Translates collections/ids/bbox/intersects/datetime/limit plus
     /// `offset` (unmodeled, arrives via `additional_fields`); `extra_filters`
     /// carries caller-built clauses (`query`/`filter` extensions — see
@@ -1065,7 +1067,7 @@ impl Store {
         cursor: Option<PageCursor>,
     ) -> Result<
         (
-            Vec<Map<String, Value>>,
+            Vec<Box<RawValue>>,
             u64,
             Option<Vec<Value>>,
             Option<Vec<Value>>,
@@ -1139,44 +1141,42 @@ impl Store {
             .send()
             .await?;
         resp.error_for_status_code_ref()?;
-        let body = resp.json::<Value>().await?;
-        let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
-        let hits: Vec<Value> = body["hits"]["hits"].as_array().cloned().unwrap_or_default();
+        let body = resp.json::<SearchEnvelope>().await?;
+        let total = body.hits.total.value;
+        let hits = body.hits.hits;
         // An extra hit proves another page; when the lookahead slot
         // didn't fit (`limit` at the cap or `from` clamped) a full page
         // stands in — a boundary-exact final page can then emit a `next`
         // link that resolves to an empty page.
         let lookahead =
             hits.len() > limit as usize || (size <= limit && hits.len() == size as usize);
-        let mut page: Vec<Value> = hits.into_iter().take(limit as usize).collect();
+        let mut page: Vec<ItemHit> = hits.into_iter().take(limit as usize).collect();
         // Sort values of a page's edges become the next/prev cursors.
         // Under a Reverse fetch the hits run backwards — the page's
         // forward-first item is the last hit and its forward-next page
         // is the anchor page (always exists); an earlier page exists
         // iff the reversed lookahead produced an extra hit.
+        fn edge_vals(h: &ItemHit) -> Option<Vec<Value>> {
+            (!h.sort.is_empty()).then(|| h.sort.clone())
+        }
         let (next_vals, prev_vals) = match cursor {
             Some(PageCursor::Reverse(_)) => {
-                let next_vals = page.first().and_then(|h| h["sort"].as_array().cloned());
+                let next_vals = page.first().and_then(edge_vals);
                 page.reverse();
                 let prev_vals = lookahead
-                    .then(|| page.first().and_then(|h| h["sort"].as_array().cloned()))
+                    .then(|| page.first().and_then(edge_vals))
                     .flatten();
                 (next_vals, prev_vals)
             }
             _ => {
-                let next_vals = lookahead
-                    .then(|| page.last().and_then(|h| h["sort"].as_array().cloned()))
-                    .flatten();
+                let next_vals = lookahead.then(|| page.last().and_then(edge_vals)).flatten();
                 let prev_vals = (cursor.is_some() || offset > 0)
-                    .then(|| page.first().and_then(|h| h["sort"].as_array().cloned()))
+                    .then(|| page.first().and_then(edge_vals))
                     .flatten();
                 (next_vals, prev_vals)
             }
         };
-        let items = page
-            .into_iter()
-            .filter_map(|h| h["_source"].as_object().cloned())
-            .collect();
+        let items = page.into_iter().filter_map(|h| h.source).collect();
         Ok((items, total, next_vals, prev_vals))
     }
 
@@ -1734,6 +1734,36 @@ fn item_field(field: &str) -> String {
 pub enum PageCursor {
     Forward(Vec<Value>),
     Reverse(Vec<Value>),
+}
+
+/// Item-search response envelope: `_source` is captured as a raw JSON
+/// slice (`RawValue`) so `geometry`/`properties`/`assets` never pay a
+/// DOM parse — handlers that can splice instead of mutate skip the
+/// whole tree.
+#[derive(Deserialize)]
+struct SearchEnvelope {
+    hits: HitsEnvelope,
+}
+
+#[derive(Deserialize)]
+struct HitsEnvelope {
+    #[serde(default)]
+    total: HitsTotal,
+    #[serde(default)]
+    hits: Vec<ItemHit>,
+}
+
+#[derive(Deserialize, Default)]
+struct HitsTotal {
+    value: u64,
+}
+
+#[derive(Deserialize)]
+struct ItemHit {
+    #[serde(default)]
+    sort: Vec<Value>,
+    #[serde(rename = "_source")]
+    source: Option<Box<RawValue>>,
 }
 
 /// `sortby` -> OpenSearch `sort` clauses; `_id` is appended as a

@@ -4,9 +4,9 @@ use crate::api_types::{GetSearch, ItemCollection, Search};
 use crate::store::{item_sort_clauses, CATALOGS_INDEX, ROOT_CATALOG_ID};
 use axum::{
     extract::{Path, Query, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde_json::{json, value::RawValue, Value};
 use stac::{Bbox, Link};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ async fn run_scoped_search(
     scope_id: &str,
     mut search: Search,
     req: Option<(axum::http::Uri, bool)>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let empty = || {
         let mut c =
             ItemCollection::new(Vec::new()).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -131,7 +131,7 @@ async fn run_scoped_search(
                     "Requested collections are outside the scope of this catalog.".to_string(),
                 ));
             }
-            return Ok(geo_json(empty()?));
+            return Ok(geo_json(empty()?).into_response());
         }
     } else {
         search.collections = allowed_collections.iter().cloned().collect();
@@ -285,10 +285,10 @@ async fn run_scoped_search(
     // nothing) short-circuits — after parsing, so malformed extension
     // params still surface their 400 (#935 semantics).
     if search.collections.is_empty() {
-        return Ok(geo_json(empty()?));
+        return Ok(geo_json(empty()?).into_response());
     }
 
-    let (mut items, matched, next_vals, prev_vals) = state
+    let (items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
             &search.collections,
@@ -300,33 +300,46 @@ async fn run_scoped_search(
         .await?;
     let base = &state.base_url;
     let link_scope = (scope_id != ROOT_CATALOG_ID).then_some(scope_id);
-    for item in items.iter_mut() {
+    // `_source` arrives as raw JSON — the fast path splices `links` in
+    // textually and never builds a DOM. Stored `links` to merge, the
+    // `fields` filter, or field exclusions drop to the map path.
+    let fast = search.items.fields.is_none() && state.excluded_item_fields.is_empty();
+    let mut features: Vec<Box<RawValue>> = Vec::with_capacity(items.len());
+    for raw in items {
+        let src = raw.get();
+        if fast {
+            if let Some(out) = splice_item_links(state, src, link_scope)? {
+                features.push(out);
+                continue;
+            }
+        }
+        let Ok(mut item) = serde_json::from_str::<serde_json::Map<String, Value>>(src) else {
+            continue;
+        };
         let item_id = item["id"].as_str().unwrap_or_default().to_string();
         if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            let mut doc = serde_json::Value::Object(std::mem::take(item));
+            let mut doc = serde_json::Value::Object(std::mem::take(&mut item));
             merge_doc_links(
                 &mut doc,
                 item_links(state, &item_id, &col, link_scope),
                 base,
             );
-            *item = doc.as_object().unwrap().clone();
+            item = doc.as_object().unwrap().clone();
         }
-    }
-    for item in items.iter_mut() {
-        strip_excluded_item_fields(state, item);
-    }
-    // Fields extension runs last — it strips generated links too.
-    if let Some(fields) = &search.items.fields {
-        for item in items.iter_mut() {
-            crate::store::filter_fields(item, &fields.include, &fields.exclude);
+        strip_excluded_item_fields(state, &mut item);
+        // Fields extension runs last — it strips generated links too.
+        if let Some(fields) = &search.items.fields {
+            crate::store::filter_fields(&mut item, &fields.include, &fields.exclude);
         }
+        features.push(
+            RawValue::from_string(
+                serde_json::to_string(&item).map_err(|e| ApiError::Internal(e.to_string()))?,
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
     }
-    let returned = items.len() as u64;
-    let mut collection =
-        ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
-    collection.number_matched = Some(matched);
-    collection.number_returned = Some(returned);
-    collection.links.push(link_json(format!("{base}/"), "root"));
+    let returned = features.len() as u64;
+    let mut links = vec![link_json(format!("{base}/"), "root")];
 
     // 4. Pagination links — upstream PagingLinks: GET merges the request
     // URL with a `token` query param (`method: GET`); POST carries the
@@ -348,22 +361,76 @@ async fn run_scoped_search(
         Some((u, _)) => format!("{base}{}", u.path()),
         None => self_href.clone(),
     };
-    collection.links.push(link_json(self_href, "self"));
+    links.push(link_json(self_href, "self"));
     if let Some(vals) = next_vals {
         let token = encode_search_after_token(&vals, false);
-        collection.links.push(match get_uri {
+        links.push(match get_uri {
             Some(u) => page_link_get("next", base, u, &token),
             None => page_link("next", &post_href, &search, &token),
         });
     }
     if let Some(vals) = prev_vals {
         let token = encode_search_after_token(&vals, true);
-        collection.links.push(match get_uri {
+        links.push(match get_uri {
             Some(u) => page_link_get("prev", base, u, &token),
             None => page_link("prev", &post_href, &search, &token),
         });
     }
-    Ok(geo_json(collection))
+    Ok(geo_json(RawItemCollection {
+        type_: "FeatureCollection",
+        features,
+        links,
+        number_matched: Some(matched),
+        number_returned: Some(returned),
+    })
+    .into_response())
+}
+
+/// `ItemCollection` shape for the search hot path: `features` are
+/// `RawValue` slices (each already carrying its `links`) serialized
+/// verbatim — no DOM round-trip per item.
+#[derive(serde::Serialize)]
+struct RawItemCollection {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    features: Vec<Box<RawValue>>,
+    links: Vec<Link>,
+    #[serde(rename = "numberMatched", skip_serializing_if = "Option::is_none")]
+    number_matched: Option<u64>,
+    #[serde(rename = "numberReturned", skip_serializing_if = "Option::is_none")]
+    number_returned: Option<u64>,
+}
+
+/// `links` splice without a DOM parse: the doc decodes as a top-level
+/// key map whose values stay raw slices, so `contains_key("links")`
+/// tells "no stored links" from "stored links to merge" (including a
+/// stored `null`, which `Option` would flatten away). A link-less doc
+/// gets the generated array inserted right after the opening brace.
+/// `None` means take the map path — non-object source, stored `links`,
+/// or no `collection` (nothing to link into).
+fn splice_item_links(
+    state: &AppState,
+    src: &str,
+    link_scope: Option<&str>,
+) -> Result<Option<Box<RawValue>>, ApiError> {
+    let Ok(members) = serde_json::from_str::<std::collections::HashMap<String, Box<RawValue>>>(src)
+    else {
+        return Ok(None);
+    };
+    if members.contains_key("links") {
+        return Ok(None);
+    }
+    let get_str =
+        |k: &str| -> Option<String> { serde_json::from_str::<String>(members.get(k)?.get()).ok() };
+    let (Some(collection), Some(rest)) = (get_str("collection"), src.strip_prefix('{')) else {
+        return Ok(None);
+    };
+    let id = get_str("id").unwrap_or_default();
+    let links = serde_json::to_string(&item_links(state, &id, &collection, link_scope))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    RawValue::from_string(format!("{{\"links\":{links},{rest}"))
+        .map(Some)
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// GET-side pagination link: rel + href (request URL with `token`

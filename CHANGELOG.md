@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_last`<->`_first`), reverses the hits back, and emits forward
   tokens from the page's endpoints, so `prev` chains recurse
   correctly. Upstream's `prev` needs Redis; this needs nothing
+- `/search` (and `/catalogs/{id}/search`) read path now decodes
+  OpenSearch hits as `serde_json::value::RawValue` envelopes —
+  `geometry`/`properties`/`assets` are never DOM-parsed on reads.
+  Docs with no stored `links`, no `fields` filter, and no excluded
+  fields get their generated `links` spliced in textually (~35%
+  faster handler-side on ~100 KB items, release build); stored
+  `links`, `fields`, and field exclusions fall back to the map
+  path per doc. Item listings keep the DOM path (they always
+  mutate)
 
 ### Fixed
 

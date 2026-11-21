@@ -1053,3 +1053,95 @@ async fn test_transactions_disabled_405s() {
     let (s, _) = call(&app, "GET", "/catalogs", None).await;
     assert_eq!(s, StatusCode::OK);
 }
+
+/// `/search` emits `links` two ways: docs with no stored `links` take
+/// the RawValue splice fast-path, docs with stored user links take the
+/// DOM merge path. Both must carry the generated rels; the stored user
+/// link must survive the merge; and the `fields` filter must still
+/// strip links via the DOM path.
+#[tokio::test]
+async fn test_search_item_links_fast_and_dom() {
+    use stac_os_rs::store::ITEMS_INDEX;
+    let Some(state) = test_state(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let app = build_app(state.clone());
+    let cat = uniq("it-links");
+    let col = uniq("it-links-col");
+    let plain_id = uniq("it-plain");
+    let linked_id = uniq("it-linked");
+
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+
+    state
+        .store
+        .index_document(
+            ITEMS_INDEX,
+            &format!("{plain_id}|{col}"),
+            common::item(&plain_id, &col),
+        )
+        .await
+        .unwrap();
+    let mut linked = common::item(&linked_id, &col);
+    linked["links"] = json!([{"rel": "license", "href": "https://example.com/lic"}]);
+    state
+        .store
+        .index_document(ITEMS_INDEX, &format!("{linked_id}|{col}"), linked)
+        .await
+        .unwrap();
+
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(json!({"collections": [col]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberReturned"], 2);
+    let feats = body["features"].as_array().unwrap();
+    let plain = feats.iter().find(|f| f["id"] == plain_id).unwrap();
+    let linked = feats.iter().find(|f| f["id"] == linked_id).unwrap();
+    let rels = |f: &Value| -> Vec<String> {
+        f["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["rel"].as_str().map(String::from))
+            .collect()
+    };
+    for f in [plain, linked] {
+        for rel in ["self", "parent", "collection", "root"] {
+            assert!(rels(f).iter().any(|r| r == rel), "missing rel {rel} on {f}");
+        }
+    }
+    assert!(rels(linked).iter().any(|r| r == "license"));
+    assert!(!rels(plain).iter().any(|r| r == "license"));
+    assert_eq!(
+        plain["geometry"],
+        json!({"type": "Point", "coordinates": [150.0, -33.0]})
+    );
+    assert_eq!(linked["geometry"], plain["geometry"]);
+
+    // `fields` forces the DOM path for every doc — links stripped.
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(json!({"collections": [col], "fields": {"include": ["id"]}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    for f in body["features"].as_array().unwrap() {
+        assert!(f.get("id").is_some());
+        assert!(f.get("links").is_none());
+    }
+}
