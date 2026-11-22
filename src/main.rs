@@ -111,6 +111,10 @@ async fn main() {
         max_batch_error_size: env_u64("MAX_BATCH_ERROR_SIZE").map(|n| n as usize),
         // `FREE_TEXT_FIELDS` (upstream): comma-separated multi_match
         // fields for item-search `q`. Unset/empty → upstream defaults.
+        // `STAC_MAX_EXPORT_ITEMS` — `?f=ndjson` result-set ceiling
+        // (`None` = unbounded). Bounds the worst-case dump so one
+        // `?f=ndjson` on a million-item registry can't stream forever.
+        max_export_items: env_u64("STAC_MAX_EXPORT_ITEMS"),
         free_text_fields: std::env::var("FREE_TEXT_FIELDS")
             .ok()
             .map(|v| {
