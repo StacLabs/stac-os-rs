@@ -1,7 +1,7 @@
 // src/handlers/items.rs
 use super::common::*;
 use super::metadata::items_sortable_fields;
-use crate::api_types::{ItemCollection, Search};
+use crate::api_types::Search;
 use crate::store::{item_sort_clauses, COLLECTIONS_INDEX, ITEMS_INDEX};
 use axum::{
     extract::{Path, Query, RawQuery, State},
@@ -43,9 +43,8 @@ pub async fn list_collection_items(
     {
         return Err(ApiError::NotFound(collection_id));
     }
-    let (mut collection, next_vals, prev_vals) =
+    let (mut collection, limit, next_vals, prev_vals) =
         items_page(&state, std::slice::from_ref(&collection_id), &query, None).await?;
-    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
         format!("{}/collections/{collection_id}/items", state.base_url),
         "self",
@@ -446,14 +445,13 @@ pub async fn list_scoped_items(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    let (mut collection, next_vals, prev_vals) = items_page(
+    let (mut collection, limit, next_vals, prev_vals) = items_page(
         &state,
         std::slice::from_ref(&collection_id),
         &query,
         Some(&catalog_id),
     )
     .await?;
-    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     collection.links.push(link_json(
         format!(
             "{}/catalogs/{catalog_id}/collections/{collection_id}/items",
@@ -478,8 +476,10 @@ pub async fn list_scoped_items(
 /// Shared items-listing pipeline: `?limit=&token=` + the features-binding
 /// filters (`ids`/`query`/`filter`/`bbox`/`datetime`/`q`) -> paginated search.
 /// `scoped_catalog_id` selects scoped vs canonical item link paths.
-/// Returns the collection plus the `next`/`prev` cursor values (the
-/// page endpoints' `search_after` keys) for the page links.
+/// Returns the collection, the effective page size (default applied and
+/// max cap enforced — the `limit=` the page links must advertise), and
+/// the `next`/`prev` cursor values (the page endpoints' `search_after`
+/// keys) for the page links.
 async fn items_page(
     state: &AppState,
     collections: &[String],
@@ -487,7 +487,8 @@ async fn items_page(
     scoped_catalog_id: Option<&str>,
 ) -> Result<
     (
-        ItemCollection,
+        RawItemCollection,
+        u64,
         Option<Vec<serde_json::Value>>,
         Option<Vec<serde_json::Value>>,
     ),
@@ -605,7 +606,7 @@ async fn items_page(
             item_sort_clauses(&search.items.sortby).len(),
         )?);
     }
-    let (mut items, matched, next_vals, prev_vals) = state
+    let (items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
             collections,
@@ -615,30 +616,24 @@ async fn items_page(
             cursor,
         )
         .await?;
-    for item in items.iter_mut() {
-        let item_id = item["id"].as_str().unwrap_or_default().to_string();
-        if let Some(col) = item["collection"].as_str().map(str::to_owned) {
-            item.insert(
-                "links".to_string(),
-                json!(item_links(state, &item_id, &col, scoped_catalog_id)),
-            );
-        }
-    }
-    for item in items.iter_mut() {
-        strip_excluded_item_fields(state, item);
-    }
-    // Fields extension runs last — it strips generated links too.
-    if let Some(fields) = &search.items.fields {
-        for item in items.iter_mut() {
-            crate::store::filter_fields(item, &fields.include, &fields.exclude);
-        }
-    }
-    let returned = items.len() as u64;
-    let mut collection =
-        ItemCollection::new(items).map_err(|e| ApiError::Internal(e.to_string()))?;
-    collection.number_matched = Some(matched);
-    collection.number_returned = Some(returned);
-    Ok((collection, next_vals, prev_vals))
+    // `_source` arrives as raw JSON — `features_from_hits` splices
+    // `links` in textually when it can, else merges stored user links
+    // alongside the generated set (same merge as `/search`).
+    let features = features_from_hits(
+        state,
+        items,
+        search.items.fields.as_ref(),
+        scoped_catalog_id,
+    )?;
+    let returned = features.len() as u64;
+    let collection = RawItemCollection {
+        type_: "FeatureCollection",
+        features,
+        links: Vec::new(),
+        number_matched: Some(matched),
+        number_returned: Some(returned),
+    };
+    Ok((collection, limit, next_vals, prev_vals))
 }
 
 /// Page links for a paged items listing — GET hrefs carrying the

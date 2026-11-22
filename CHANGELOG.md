@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Item read paths (`/search`, `/catalogs/{id}/search`, both items
+  listings) now decode OpenSearch hits as
+  `serde_json::value::RawValue` envelopes — `geometry`/`properties`/
+  `assets` are never DOM-parsed on reads. Docs with no stored
+  `links`, no `fields` filter, and no excluded fields get their
+  generated `links` spliced in textually (~35% faster handler-side
+  on ~100 KB items, release build); stored `links`, `fields`, and
+  field exclusions fall back to the map path per doc, which merges
+  stored user links exactly as before
+
+### Fixed
+
+- Items listings (`GET /collections/{id}/items` and the scoped
+  `/catalogs/{id}/collections/{id}/items`) previously *overwrote*
+  `links` with the generated set, silently dropping stored user
+  links (`license`, `derived_from`, …); they now merge like
+  `/search` does
+
 ## [0.9.0] - 2026-11-19
 
 ### Added
