@@ -112,21 +112,6 @@ async fn run_scoped_search(
         search.items.additional_fields.shift_remove("token");
     }
 
-    // `?f=` output format — popped like `token` so the unmodeled param
-    // never reaches `page_link` bodies or spec validation. A POST body
-    // `f` must be a string (`{"f": "ndjson"}`).
-    let format = match search.items.additional_fields.shift_remove("f") {
-        None | Some(serde_json::Value::Null) => ItemFormat::GeoJson,
-        Some(serde_json::Value::String(s)) => {
-            item_format(Some(s.as_str()), &state.enabled_formats)?
-        }
-        Some(_) => {
-            return Err(ApiError::BadRequest(
-                "Invalid parameters provided: f".to_string(),
-            ))
-        }
-    };
-
     // Scope: intersect requested collections with the catalog's
     // descendants. A request naming only out-of-scope collections is a
     // 403 (upstream semantics); parsing happens after this check.
@@ -140,17 +125,33 @@ async fn run_scoped_search(
         search
             .collections
             .retain(|c| allowed_collections.contains(c));
-        if search.collections.is_empty() {
-            if scope_id != ROOT_CATALOG_ID {
-                return Err(ApiError::Forbidden(
-                    "Requested collections are outside the scope of this catalog.".to_string(),
-                ));
-            }
-            return Ok(geo_json(empty()?).into_response());
+        if search.collections.is_empty() && scope_id != ROOT_CATALOG_ID {
+            return Err(ApiError::Forbidden(
+                "Requested collections are outside the scope of this catalog.".to_string(),
+            ));
         }
+        // Root with every named collection filtered out falls through —
+        // extension params still surface their 400s (#935), then the
+        // empty-scope short-circuit answers in the negotiated format.
     } else {
         search.collections = allowed_collections.iter().cloned().collect();
     }
+
+    // `?f=` output format — popped like `token` so the unmodeled param
+    // never reaches `page_link` bodies or spec validation, but (like
+    // the other extension params) validated only after the scope 403.
+    // A POST body `f` must be a string (`{"f": "ndjson"}`).
+    let format = match search.items.additional_fields.shift_remove("f") {
+        None | Some(serde_json::Value::Null) => ItemFormat::GeoJson,
+        Some(serde_json::Value::String(s)) => {
+            item_format(Some(s.as_str()), &state.enabled_formats)?
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "Invalid parameters provided: f".to_string(),
+            ))
+        }
+    };
 
     // Deferred GET params the crate can't model — parsed now, in
     // upstream order (query → intersects → filter-lang).
@@ -579,7 +580,8 @@ pub async fn scoped_search_post(
         ("query" = Option<String>, Query, description = "STACQL query (JSON-encoded on GET)"),
         ("filter" = Option<String>, Query, description = "CQL2 filter (text or JSON-encoded)"),
         ("filter-lang" = Option<String>, Query, description = "Filter language: cql2-text or cql2-json"),
-        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries")
+        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries"),
+        ("f" = Option<String>, Query, description = "Output format: geojson FeatureCollection (default) or ndjson item stream")
     ),
     responses(
         (status = 200, description = "Successful response"),
@@ -641,7 +643,8 @@ pub async fn catalogs_search_post(
         ("query" = Option<String>, Query, description = "STACQL query (JSON-encoded on GET)"),
         ("filter" = Option<String>, Query, description = "CQL2 filter (text or JSON-encoded)"),
         ("filter-lang" = Option<String>, Query, description = "Filter language: cql2-text or cql2-json"),
-        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries")
+        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries"),
+        ("f" = Option<String>, Query, description = "Output format: geojson FeatureCollection (default) or ndjson item stream")
     ),
     responses(
         (status = 200, description = "Successful response"),
@@ -680,7 +683,8 @@ pub async fn catalogs_search_get(
         ("query" = Option<String>, Query, description = "STACQL query (JSON-encoded on GET)"),
         ("filter" = Option<String>, Query, description = "CQL2 filter (text or JSON-encoded)"),
         ("filter-lang" = Option<String>, Query, description = "Filter language: cql2-text or cql2-json"),
-        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries")
+        ("filter-crs" = Option<String>, Query, description = "CRS for filter geometries"),
+        ("f" = Option<String>, Query, description = "Output format: geojson FeatureCollection (default) or ndjson item stream")
     ),
     responses(
         (status = 200, description = "Successful response"),

@@ -5,6 +5,7 @@ use stac_os_rs::{
     links::LinkEngine,
     store::Store,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -127,7 +128,7 @@ async fn main() {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(|v| {
-                let mut set: std::collections::HashSet<ItemFormat> = v
+                let mut set: HashSet<ItemFormat> = v
                     .split(',')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())

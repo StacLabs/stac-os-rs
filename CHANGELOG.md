@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A root `/search` (or `/catalogs/search`) naming only unknown
+  collections no longer short-circuits before extension-param
+  parsing — malformed `query`/`filter`/`intersects`/`q` now surface
+  their `400`s (#935 ordering) before the empty result, and
+  `?f=ndjson` answers an empty stream instead of a FeatureCollection
 - Item read paths (`/search`, `/catalogs/{id}/search`, both items
   listings) now decode OpenSearch hits as
   `serde_json::value::RawValue` envelopes — `geometry`/`properties`/

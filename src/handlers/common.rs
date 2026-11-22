@@ -10,7 +10,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use stac::{Catalog, Collection, Item, Link};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// `Json` extractor that maps every rejection to `400 Bad Request` — STAC
@@ -114,7 +114,7 @@ pub struct AppState {
     pub max_export_items: Option<u64>,
     /// `STAC_ENABLED_FORMATS` — `?f=` values this server answers.
     /// `geojson` is the wire format and is always present.
-    pub enabled_formats: std::collections::HashSet<ItemFormat>,
+    pub enabled_formats: HashSet<ItemFormat>,
 }
 
 impl AppState {
@@ -698,7 +698,7 @@ impl ItemFormat {
 
 /// Every implemented `?f=` value — the `AppState.enabled_formats`
 /// default when `STAC_ENABLED_FORMATS` is unset.
-pub fn all_item_formats() -> std::collections::HashSet<ItemFormat> {
+pub fn all_item_formats() -> HashSet<ItemFormat> {
     [ItemFormat::GeoJson, ItemFormat::NdJson]
         .into_iter()
         .collect()
@@ -706,7 +706,7 @@ pub fn all_item_formats() -> std::collections::HashSet<ItemFormat> {
 
 pub(crate) fn item_format(
     raw: Option<&str>,
-    enabled: &std::collections::HashSet<ItemFormat>,
+    enabled: &HashSet<ItemFormat>,
 ) -> Result<ItemFormat, ApiError> {
     let fmt = match raw {
         None => ItemFormat::GeoJson,
@@ -726,9 +726,11 @@ pub(crate) fn item_format(
 /// streamed straight from `_source` bytes — O(page) memory for any
 /// result size. Pages chain on forward `search_after` cursors, so a
 /// `token` is honored as a dump start position while `limit` is
-/// ignored (fetches run at the search cap). The first page is fetched
-/// eagerly so backend failures still surface as a 500 instead of a
-/// truncated body; mid-stream failures end the response.
+/// ignored (fetches run at the search cap). A `prev` token's anchor is
+/// a sort position like any other — the dump streams everything after
+/// it. The first page is fetched eagerly so backend failures still
+/// surface as a 500 instead of a truncated body; mid-stream failures
+/// end the response.
 ///
 /// `application/x-ndjson` advertises the `\n`-delimited bytes as-is —
 /// `application/geo+json-seq` (RFC 8142) would demand `RS` separators
@@ -743,6 +745,12 @@ pub(crate) async fn ndjson_response(
 ) -> Result<Response, ApiError> {
     let mut search = search.clone();
     search.items.limit = Some(crate::store::MAX_SEARCH_LIMIT - 1);
+    // A `prev` token decodes to a Reverse cursor — for a dump it's a
+    // start position like any `next` token: stream everything after it.
+    let cursor = cursor.map(|c| match c {
+        crate::store::PageCursor::Reverse(vals) => crate::store::PageCursor::Forward(vals),
+        c => c,
+    });
     let (buf, next, matched) = ndjson_page(
         state,
         collections,
@@ -764,10 +772,7 @@ pub(crate) async fn ndjson_response(
     let filters = extra_filters.to_vec();
     let link_scope = link_scope.map(str::to_owned);
     let stream = futures_util::stream::unfold(
-        (
-            buf.into_iter().collect::<std::collections::VecDeque<_>>(),
-            next,
-        ),
+        (buf.into_iter().collect::<VecDeque<_>>(), next),
         move |(mut buf, mut next)| {
             let (state, collections, search, filters, link_scope) = (
                 Arc::clone(&state),
