@@ -1,10 +1,33 @@
 # stac-os-rs
-<img src="assets/glass-osiris.png" alt="STAC-OSIRIS" width="400">
+<img src="assets/brown-osiris-cropped.png" alt="STAC-OSIRIS" width="400">
 <!-- ![StacLabs](https://github.com/StacLabs/.github/raw/main/profile/staclabs-orange-banner.png) -->
 
 A STAC API Opensearch server built with Rust
 
 This project would not be possible without the contributors to [stac-fastapi](https://github.com/stac-utils/stac-fastapi) and [stac-fastapi-elasticsearch-opensearch](https://github.com/stac-utils/stac-fastapi-elasticsearch-opensearch) — it's a port of their ideas and hard work to Rust.
+
+## Sponsors & Supporters
+
+The following organizations have contributed time and/or funding to support the development of this project:
+
+<p>
+<a href="https://healy-hyperspatial.github.io/"><img src="https://raw.githubusercontent.com/stac-utils/stac-fastapi-elasticsearch-opensearch/refs/heads/main/assets/hh-logo-blue.png" alt="Healy Hyperspatial" height="70" hspace="15" vspace="10"></a>
+<a href="https://github.com/StacLabs"><img src="assets/staclabs-icon-black.png" alt="StacLabs" height="70" hspace="15" vspace="10"></a>
+</p>
+
+## Latest News
+
+- **11/21/2026:** ⚡ **Raw `RawValue` read path lands** ([PR #31](https://github.com/StacLabs/stac-os-rs/pull/31)) — item reads (`/search`, `/catalogs/{id}/search`, and both items listings) now decode OpenSearch hits as `serde_json::value::RawValue` envelopes: `geometry`, `properties`, and `assets` are never DOM-parsed on the way out. Docs with no stored `links`, no `fields` filter, and no field exclusions get their generated `links` spliced in textually. Measured on the standard `stac-api-load-testing` workload (4 collections, 2,000 items, 8 locust workers): **~17% more requests/sec at every concurrency level** (2,268 vs 1,931 rps at 100 users) with p99 latency ~18% lower — and ~35% faster handler-side on heavy ~100 KB items. The same change fixed items listings silently *overwriting* `links` — discarding stored **user** links like `license` — they now merge exactly like `/search`.
+
+- **11/05/2026:** 🦀 **stac-os-rs — SFEOS in Rust!** Work has begun on [stac-os-rs](https://github.com/jonhealy1/stac-os-rs), a Rust implementation of this API. In early benchmarking with [stac-api-load-testing](https://github.com/StacLabs/stac-api-load-testing) it already serves roughly **2.2× the throughput of stac-fastapi-opensearch (sfeos) and ~8.7× stac-fastapi-pgstac** on the same dataset and workload — about 2,200 requests/sec vs ~1,000 at 50 concurrent users with zero failures — and its p99 latency is below stac-fastapi-opensearch's median. It's early days; follow the repo for progress. At ~8.7× the throughput of stac-fastapi-pgstac, the Rust + OpenSearch combination can serve the same workload on a fraction of the hardware — which is both an environmental and an economic argument for switching. It's also worth noting that sfeos itself was already ~4× faster than stac-fastapi-pgstac in these runs. 
+
+<details style="border: 1px solid #eaecef; border-radius: 6px; padding: 10px; margin-bottom: 16px; background-color: #f9f9f9;">
+<summary style="cursor: pointer; font-weight: bold; margin: -10px -10px 0; padding: 10px; background-color: #f0f0f0; border-bottom: 1px solid #eaecef; border-top-left-radius: 6px; border-top-right-radius: 6px;">View Older News (Click to Expand)</summary>
+
+-------------
+<!-- Add more older news items here in Markdown format; GitHub will parse them thanks to the blank line implicit in this structure -->
+
+</details>
 
 ## Contents
 
