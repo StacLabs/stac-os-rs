@@ -1,5 +1,10 @@
 // src/main.rs
-use stac_os_rs::{build_app, handlers::AppState, links::LinkEngine, store::Store};
+use stac_os_rs::{
+    build_app,
+    handlers::{AppState, ItemFormat},
+    links::LinkEngine,
+    store::Store,
+};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -115,6 +120,26 @@ async fn main() {
         // (`None` = unbounded). Bounds the worst-case dump so one
         // `?f=ndjson` on a million-item registry can't stream forever.
         max_export_items: env_u64("STAC_MAX_EXPORT_ITEMS"),
+        // `STAC_ENABLED_FORMATS` — comma-separated `?f=` allowlist;
+        // unset/empty = all formats. `geojson` is the wire format and
+        // can't be disabled. Unknown names fail startup loudly.
+        enabled_formats: std::env::var("STAC_ENABLED_FORMATS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| {
+                let mut set: std::collections::HashSet<ItemFormat> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        ItemFormat::from_name(s)
+                            .unwrap_or_else(|| panic!("STAC_ENABLED_FORMATS: unknown format '{s}'"))
+                    })
+                    .collect();
+                set.insert(ItemFormat::GeoJson);
+                set
+            })
+            .unwrap_or_else(stac_os_rs::handlers::all_item_formats),
         free_text_fields: std::env::var("FREE_TEXT_FIELDS")
             .ok()
             .map(|v| {

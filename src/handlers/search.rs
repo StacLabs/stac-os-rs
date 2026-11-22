@@ -117,7 +117,9 @@ async fn run_scoped_search(
     // `f` must be a string (`{"f": "ndjson"}`).
     let format = match search.items.additional_fields.shift_remove("f") {
         None | Some(serde_json::Value::Null) => ItemFormat::GeoJson,
-        Some(serde_json::Value::String(s)) => item_format(Some(s.as_str()))?,
+        Some(serde_json::Value::String(s)) => {
+            item_format(Some(s.as_str()), &state.enabled_formats)?
+        }
         Some(_) => {
             return Err(ApiError::BadRequest(
                 "Invalid parameters provided: f".to_string(),

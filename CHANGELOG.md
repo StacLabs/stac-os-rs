@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `413` (the matched count is known from the first page, so no
   truncated stream is ever emitted); unset = unlimited. Only applies
   to `?f=ndjson` — FeatureCollection responses are unaffected
+- `STAC_ENABLED_FORMATS` env var — comma-separated allowlist of
+  `?f=` output formats (unset = all). A disabled format answers
+  `400` on every item-search/items surface; `geojson` can't be
+  disabled (it's the wire format), and unknown names fail startup
 
 ### Changed
 

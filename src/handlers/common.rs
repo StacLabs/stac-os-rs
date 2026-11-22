@@ -112,6 +112,9 @@ pub struct AppState {
     /// The eager first page reveals `numberMatched`, so the cap costs
     /// no extra request.
     pub max_export_items: Option<u64>,
+    /// `STAC_ENABLED_FORMATS` — `?f=` values this server answers.
+    /// `geojson` is the wire format and is always present.
+    pub enabled_formats: std::collections::HashSet<ItemFormat>,
 }
 
 impl AppState {
@@ -676,20 +679,47 @@ pub(crate) fn features_from_hits(
 /// `?f=` output format (OGC Features convention): GeoJSON
 /// FeatureCollection by default, or newline-delimited items for
 /// unpaginated dumps (`ndjson`/`geojsonseq`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ItemFormat {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ItemFormat {
     GeoJson,
     NdJson,
 }
 
-pub(crate) fn item_format(raw: Option<&str>) -> Result<ItemFormat, ApiError> {
-    match raw {
-        None | Some("geojson") | Some("json") => Ok(ItemFormat::GeoJson),
-        Some("ndjson") | Some("geojsonseq") => Ok(ItemFormat::NdJson),
-        Some(_) => Err(ApiError::BadRequest(
-            "Invalid parameters provided: f".to_string(),
-        )),
+impl ItemFormat {
+    /// Parse a `?f=` value, canonical name or alias.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "geojson" | "json" => Some(Self::GeoJson),
+            "ndjson" | "geojsonseq" => Some(Self::NdJson),
+            _ => None,
+        }
     }
+}
+
+/// Every implemented `?f=` value — the `AppState.enabled_formats`
+/// default when `STAC_ENABLED_FORMATS` is unset.
+pub fn all_item_formats() -> std::collections::HashSet<ItemFormat> {
+    [ItemFormat::GeoJson, ItemFormat::NdJson]
+        .into_iter()
+        .collect()
+}
+
+pub(crate) fn item_format(
+    raw: Option<&str>,
+    enabled: &std::collections::HashSet<ItemFormat>,
+) -> Result<ItemFormat, ApiError> {
+    let fmt = match raw {
+        None => ItemFormat::GeoJson,
+        Some(v) => ItemFormat::from_name(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid parameters provided: f".to_string()))?,
+    };
+    if !enabled.contains(&fmt) {
+        return Err(ApiError::BadRequest(format!(
+            "Format '{}' is not enabled on this server",
+            raw.unwrap_or("geojson")
+        )));
+    }
+    Ok(fmt)
 }
 
 /// `?f=ndjson` response: every matching item as newline-delimited JSON,
@@ -1713,12 +1743,35 @@ mod tests {
 
     #[test]
     fn test_item_format() {
-        assert_eq!(item_format(None).unwrap(), ItemFormat::GeoJson);
-        assert_eq!(item_format(Some("geojson")).unwrap(), ItemFormat::GeoJson);
-        assert_eq!(item_format(Some("json")).unwrap(), ItemFormat::GeoJson);
-        assert_eq!(item_format(Some("ndjson")).unwrap(), ItemFormat::NdJson);
-        assert_eq!(item_format(Some("geojsonseq")).unwrap(), ItemFormat::NdJson);
-        assert!(item_format(Some("xml")).is_err());
+        let all = all_item_formats();
+        assert_eq!(item_format(None, &all).unwrap(), ItemFormat::GeoJson);
+        assert_eq!(
+            item_format(Some("geojson"), &all).unwrap(),
+            ItemFormat::GeoJson
+        );
+        assert_eq!(
+            item_format(Some("json"), &all).unwrap(),
+            ItemFormat::GeoJson
+        );
+        assert_eq!(
+            item_format(Some("ndjson"), &all).unwrap(),
+            ItemFormat::NdJson
+        );
+        assert_eq!(
+            item_format(Some("geojsonseq"), &all).unwrap(),
+            ItemFormat::NdJson
+        );
+        assert!(item_format(Some("xml"), &all).is_err());
+
+        // `STAC_ENABLED_FORMATS=geojson`: `?f=ndjson` is a known-but-
+        // disabled 400 — distinct from the unknown-format 400.
+        let geojson_only = [ItemFormat::GeoJson].into_iter().collect();
+        let err = item_format(Some("ndjson"), &geojson_only).unwrap_err();
+        assert!(err.to_string().contains("not enabled"));
+        assert_eq!(
+            item_format(None, &geojson_only).unwrap(),
+            ItemFormat::GeoJson
+        );
     }
 
     fn children_links(rels: &[&str]) -> serde_json::Value {

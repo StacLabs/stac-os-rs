@@ -196,6 +196,8 @@ curl -s -X POST http://localhost:3000/search \
 
 `f` accepts `geojson`/`json`/`ndjson`/`geojsonseq` — anything else (or a non-string `f` in a POST body) is a `400`. `fields` filters and `EXCLUDED_FROM_ITEMS` exclusions apply to the streamed items the same way they do to the FeatureCollection response.
 
+**Formats can be disabled** — `STAC_ENABLED_FORMATS=geojson` turns off the NDJSON export entirely: `?f=ndjson` (and `geojsonseq`) then get a `400` saying the format isn't enabled, while FeatureCollection responses are untouched. Useful when an operator wants exports off rather than just bounded. `geojson` itself can't be disabled — it's the wire format.
+
 **Export ceiling** — a full-catalog dump means sequential `search_after` fetches against OpenSearch plus a long-lived response; several concurrent unbounded exports add real load. Set [`STAC_MAX_EXPORT_ITEMS`](#configuration-reference) to cap the result set a single `?f=ndjson` request may stream: when `numberMatched` exceeds it the request fails fast with `413` (the matched count is known from the first page, so the cap costs nothing and never yields a truncated stream). Unset = unlimited. The cap only applies to `?f=ndjson` — normal paginated FeatureCollection responses are unaffected.
 
 ## Getting Started (coming from Python?)
@@ -268,6 +270,7 @@ All variables are read once at startup — changing them requires a restart.
 | `STAC_DEFAULT_ITEM_LIMIT` | Default page size for item listings and `/search` when `limit` isn't given. | `10` | Optional |
 | `STAC_GLOBAL_ITEM_MAX_LIMIT` | Hard cap on item page size — larger `limit` values clamp to this. | none | Optional |
 | `STAC_MAX_EXPORT_ITEMS` | Max items a single `?f=ndjson` export may stream — larger result sets fail fast with `413` (see [Item export formats](#item-export-formats-f)). | none (unlimited) | Optional |
+| `STAC_ENABLED_FORMATS` | Comma-separated `?f=` allowlist (`geojson`, `ndjson`). A disabled format gets a `400`; `geojson` can't be removed — it's the wire format. Unknown names fail startup. | all formats | Optional |
 
 **Filtering & Exclusions**
 

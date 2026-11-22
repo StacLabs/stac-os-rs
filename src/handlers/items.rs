@@ -505,7 +505,7 @@ async fn items_page(
     scoped_catalog_id: Option<&str>,
 ) -> Result<ItemsPage, ApiError> {
     check_filter_crs(query.filter_crs.as_deref())?;
-    let format = item_format(query.f.as_deref())?;
+    let format = item_format(query.f.as_deref(), &state.enabled_formats)?;
     let (limit, _) = list_window(
         query.limit,
         None,

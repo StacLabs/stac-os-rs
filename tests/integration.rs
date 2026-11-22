@@ -401,6 +401,73 @@ async fn test_search_ndjson_export_cap() {
 }
 
 #[tokio::test]
+async fn test_search_ndjson_format_disabled() {
+    // `STAC_ENABLED_FORMATS=geojson`: `?f=ndjson` is a known-but-
+    // disabled 400 on every surface; FeatureCollection unaffected.
+    let Some((app, _)) = test_app_flags(TestFlags {
+        enabled_formats: Some(
+            [stac_os_rs::handlers::ItemFormat::GeoJson]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    })
+    .await
+    else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let cat = uniq("it-nddis");
+    let col = uniq("it-nddis-col");
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(item(&uniq("it-nddis-item"))),
+    )
+    .await;
+
+    for path in [
+        format!("/catalogs/{cat}/search?f=ndjson"),
+        format!("/catalogs/{cat}/collections/{col}/items?f=ndjson"),
+        format!("/catalogs/{cat}/collections/{col}/items?f=geojsonseq"),
+    ] {
+        let (s, body) = call(&app, "GET", &path, None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{path}");
+        assert!(body["detail"].as_str().unwrap().contains("not enabled"));
+    }
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(json!({"f": "ndjson"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body["detail"].as_str().unwrap().contains("not enabled"));
+
+    let (s, body) = call(&app, "GET", &format!("/catalogs/{cat}/search"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"].as_u64().unwrap(), 1);
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?f=geojson"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_search_bbox_datetime_intersects_ids() {
     let Some(state) = test_state(true).await else {
         eprintln!("skipping: OpenSearch unreachable");

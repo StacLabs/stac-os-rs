@@ -33,6 +33,7 @@ fn state() -> Arc<AppState> {
         max_topology_vertices: 5000,
         max_batch_error_size: None,
         max_export_items: None,
+        enabled_formats: stac_os_rs::handlers::all_item_formats(),
         free_text_fields: stac_os_rs::handlers::default_free_text_fields(),
     })
 }
