@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `?f=ndjson` (alias `geojsonseq`) on item search (`/search`,
+  `/catalogs/{id}/search`, GET and POST) and items listings
+  (`/collections/{id}/items` and the scoped variant): streams every
+  matching item as newline-delimited JSON (`application/x-ndjson`)
+  straight from `_source` bytes — unpaginated, O(page) memory,
+  generated `links` merged per item like the FeatureCollection path.
+  `f` is honored in POST bodies (body wins over the `?f=` query
+  param); unknown or non-string `f` values are a 400
+- `STAC_MAX_EXPORT_ITEMS` env var — ceiling on the result set a
+  single `?f=ndjson` request may stream. Exceeding it fails fast
+  with `413` (the matched count is known from the first page, so no
+  truncated stream is ever emitted); unset = unlimited. Only applies
+  to `?f=ndjson` — FeatureCollection responses are unaffected
+- `STAC_ENABLED_FORMATS` env var — comma-separated allowlist of
+  `?f=` output formats (unset = all). A disabled format answers
+  `400` on every item-search/items surface; `geojson` can't be
+  disabled (it's the wire format), and unknown names fail startup
+
 ### Changed
 
+- A root `/search` (or `/catalogs/search`) naming only unknown
+  collections no longer short-circuits before extension-param
+  parsing — malformed `query`/`filter`/`intersects`/`q` now surface
+  their `400`s (#935 ordering) before the empty result, and
+  `?f=ndjson` answers an empty stream instead of a FeatureCollection
 - Item read paths (`/search`, `/catalogs/{id}/search`, both items
   listings) now decode OpenSearch hits as
   `serde_json::value::RawValue` envelopes — `geometry`/`properties`/

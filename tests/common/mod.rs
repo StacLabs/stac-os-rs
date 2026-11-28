@@ -102,6 +102,12 @@ pub struct TestFlags {
     pub enable_topology_validation: bool,
     pub max_topology_vertices: usize,
     pub max_batch_error_size: Option<usize>,
+    /// `STAC_MAX_EXPORT_ITEMS` — `?f=ndjson` result-set ceiling.
+    pub max_export_items: Option<u64>,
+    /// `STAC_ENABLED_FORMATS` — `?f=` allowlist (`None` = all formats).
+    /// `geojson` can't be disabled: it's forced on like the real env
+    /// parse does.
+    pub enabled_formats: Option<std::collections::HashSet<stac_os_rs::handlers::ItemFormat>>,
     /// `FREE_TEXT_FIELDS` override — `None` uses the upstream defaults.
     pub free_text_fields: Option<Vec<String>>,
 }
@@ -215,6 +221,14 @@ async fn test_state_opts(
             flags.max_topology_vertices
         },
         max_batch_error_size: flags.max_batch_error_size,
+        max_export_items: flags.max_export_items,
+        enabled_formats: flags
+            .enabled_formats
+            .map(|mut s| {
+                s.insert(stac_os_rs::handlers::ItemFormat::GeoJson);
+                s
+            })
+            .unwrap_or_else(stac_os_rs::handlers::all_item_formats),
         free_text_fields: flags
             .free_text_fields
             .clone()
@@ -255,6 +269,19 @@ pub async fn call_headers(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let (status, headers, bytes) = call_raw(app, method, uri, body).await;
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, headers, json)
+}
+
+/// `call_headers` variant returning the raw body bytes — for
+/// non-JSON responses (`?f=ndjson` streams).
+pub async fn call_raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -265,8 +292,7 @@ pub async fn call_headers(
     let status = resp.status();
     let headers = resp.headers().clone();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, headers, json)
+    (status, headers, bytes.to_vec())
 }
 
 /// Owned-URI variant of `call` — use for futures held across `join!`s

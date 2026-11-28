@@ -2,6 +2,7 @@
 use crate::links::LinkEngine;
 use crate::store::{NodeKind, Store, CATALOGS_INDEX, COLLECTIONS_INDEX, ROOT_CATALOG_ID};
 use axum::{
+    body::{Body, Bytes},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -9,7 +10,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use stac::{Catalog, Collection, Item, Link};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 /// `Json` extractor that maps every rejection to `400 Bad Request` — STAC
 /// returns 400, not axum's default 422, for malformed request bodies.
@@ -105,6 +107,14 @@ pub struct AppState {
     /// `q` (boost syntax like `properties.title^3` allowed). Unset or
     /// empty falls back to [`default_free_text_fields`].
     pub free_text_fields: Vec<String>,
+    /// `STAC_MAX_EXPORT_ITEMS` — ceiling on `?f=ndjson` dumps: a search
+    /// matching more items gets a 413 up front (`None` = unbounded).
+    /// The eager first page reveals `numberMatched`, so the cap costs
+    /// no extra request.
+    pub max_export_items: Option<u64>,
+    /// `STAC_ENABLED_FORMATS` — `?f=` values this server answers.
+    /// `geojson` is the wire format and is always present.
+    pub enabled_formats: HashSet<ItemFormat>,
 }
 
 impl AppState {
@@ -260,6 +270,9 @@ pub struct ListQuery {
     pub filter_crs: Option<String>,
     pub bbox: Option<String>,
     pub datetime: Option<String>,
+    /// OGC Features `?f=` output format (`ndjson` for an unpaginated
+    /// item stream) — consumed by `items_page` only.
+    pub f: Option<String>,
 }
 
 /// `filter-crs` declares the CRS of spatial literals in `filter`. Only
@@ -661,6 +674,177 @@ pub(crate) fn features_from_hits(
         );
     }
     Ok(features)
+}
+
+/// `?f=` output format (OGC Features convention): GeoJSON
+/// FeatureCollection by default, or newline-delimited items for
+/// unpaginated dumps (`ndjson`/`geojsonseq`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ItemFormat {
+    GeoJson,
+    NdJson,
+}
+
+impl ItemFormat {
+    /// Parse a `?f=` value, canonical name or alias.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "geojson" | "json" => Some(Self::GeoJson),
+            "ndjson" | "geojsonseq" => Some(Self::NdJson),
+            _ => None,
+        }
+    }
+}
+
+/// Every implemented `?f=` value — the `AppState.enabled_formats`
+/// default when `STAC_ENABLED_FORMATS` is unset.
+pub fn all_item_formats() -> HashSet<ItemFormat> {
+    [ItemFormat::GeoJson, ItemFormat::NdJson]
+        .into_iter()
+        .collect()
+}
+
+pub(crate) fn item_format(
+    raw: Option<&str>,
+    enabled: &HashSet<ItemFormat>,
+) -> Result<ItemFormat, ApiError> {
+    let fmt = match raw {
+        None => ItemFormat::GeoJson,
+        Some(v) => ItemFormat::from_name(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid parameters provided: f".to_string()))?,
+    };
+    if !enabled.contains(&fmt) {
+        return Err(ApiError::BadRequest(format!(
+            "Format '{}' is not enabled on this server",
+            raw.unwrap_or("geojson")
+        )));
+    }
+    Ok(fmt)
+}
+
+/// `?f=ndjson` response: every matching item as newline-delimited JSON,
+/// streamed straight from `_source` bytes — O(page) memory for any
+/// result size. Pages chain on forward `search_after` cursors, so a
+/// `token` is honored as a dump start position while `limit` is
+/// ignored (fetches run at the search cap). A `prev` token's anchor is
+/// a sort position like any other — the dump streams everything after
+/// it. The first page is fetched eagerly so backend failures still
+/// surface as a 500 instead of a truncated body; mid-stream failures
+/// end the response.
+///
+/// `application/x-ndjson` advertises the `\n`-delimited bytes as-is —
+/// `application/geo+json-seq` (RFC 8142) would demand `RS` separators
+/// that `jq`/`rustac`/`ogr2ogr` pipelines don't want.
+pub(crate) async fn ndjson_response(
+    state: &Arc<AppState>,
+    collections: &[String],
+    search: &crate::api_types::Search,
+    extra_filters: &[Value],
+    link_scope: Option<&str>,
+    cursor: Option<crate::store::PageCursor>,
+) -> Result<Response, ApiError> {
+    let mut search = search.clone();
+    search.items.limit = Some(crate::store::MAX_SEARCH_LIMIT - 1);
+    // A `prev` token decodes to a Reverse cursor — for a dump it's a
+    // start position like any `next` token: stream everything after it.
+    let cursor = cursor.map(|c| match c {
+        crate::store::PageCursor::Reverse(vals) => crate::store::PageCursor::Forward(vals),
+        c => c,
+    });
+    let (buf, next, matched) = ndjson_page(
+        state,
+        collections,
+        &search,
+        extra_filters,
+        link_scope,
+        cursor,
+    )
+    .await?;
+    if let Some(max) = state.max_export_items {
+        if matched > max {
+            return Err(ApiError::PayloadTooLarge(format!(
+                "Result set exceeds STAC_MAX_EXPORT_ITEMS ({matched} items > {max}) — narrow the search"
+            )));
+        }
+    }
+    let state = Arc::clone(state);
+    let collections = collections.to_vec();
+    let filters = extra_filters.to_vec();
+    let link_scope = link_scope.map(str::to_owned);
+    let stream = futures_util::stream::unfold(
+        (buf.into_iter().collect::<VecDeque<_>>(), next),
+        move |(mut buf, mut next)| {
+            let (state, collections, search, filters, link_scope) = (
+                Arc::clone(&state),
+                collections.clone(),
+                search.clone(),
+                filters.clone(),
+                link_scope.clone(),
+            );
+            async move {
+                loop {
+                    if let Some(item) = buf.pop_front() {
+                        let mut line = item.get().to_owned();
+                        line.push('\n');
+                        return Some((Ok(Bytes::from(line)), (buf, next)));
+                    }
+                    let vals = next.take()?;
+                    match ndjson_page(
+                        &state,
+                        &collections,
+                        &search,
+                        &filters,
+                        link_scope.as_deref(),
+                        Some(crate::store::PageCursor::Forward(vals)),
+                    )
+                    .await
+                    {
+                        Ok((features, nv, _)) => {
+                            buf = features.into_iter().collect();
+                            next = nv;
+                        }
+                        Err(e) => return Some((Err(e), (buf, None))),
+                    }
+                }
+            }
+        },
+    );
+    Ok((
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// One `search_items` page run through `features_from_hits` — the unit
+/// `ndjson_response` streams.
+async fn ndjson_page(
+    state: &Arc<AppState>,
+    collections: &[String],
+    search: &crate::api_types::Search,
+    extra_filters: &[Value],
+    link_scope: Option<&str>,
+    cursor: Option<crate::store::PageCursor>,
+) -> Result<
+    (
+        Vec<Box<serde_json::value::RawValue>>,
+        Option<Vec<Value>>,
+        u64,
+    ),
+    ApiError,
+> {
+    let (items, matched, next, _) = state
+        .store
+        .search_items(
+            collections,
+            search,
+            extra_filters.to_vec(),
+            state.default_item_limit,
+            cursor,
+        )
+        .await?;
+    let features = features_from_hits(state, items, search.items.fields.as_ref(), link_scope)?;
+    Ok((features, next, matched))
 }
 
 /// STAC API - Children v1.0.0 invariants for the `/children` response:
@@ -1474,6 +1658,7 @@ pub(crate) fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Va
 
 // --- Error Handling ---
 
+#[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
     /// Structured `{"detail": <object>}` body — upstream raises
@@ -1488,6 +1673,8 @@ pub enum ApiError {
     PreconditionFailed,
     /// `If-Match` header required but absent (428).
     PreconditionRequired(String),
+    /// `?f=ndjson` result set exceeds `STAC_MAX_EXPORT_ITEMS` (413).
+    PayloadTooLarge(String),
     /// Optimistic-concurrency retries exhausted — retry the request.
     WriteConflict(String),
     /// An upstream-service dependency failed — e.g. a STAC extension
@@ -1495,6 +1682,26 @@ pub enum ApiError {
     BadGateway(String),
     Internal(String),
 }
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::BadRequest(m)
+            | ApiError::Forbidden(m)
+            | ApiError::NotFound(m)
+            | ApiError::Conflict(m)
+            | ApiError::PreconditionRequired(m)
+            | ApiError::PayloadTooLarge(m)
+            | ApiError::WriteConflict(m)
+            | ApiError::BadGateway(m)
+            | ApiError::Internal(m) => f.write_str(m),
+            ApiError::JsonDetail(_, detail) => write!(f, "{detail}"),
+            ApiError::PreconditionFailed => f.write_str("If-Match precondition failed"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl From<opensearch::Error> for ApiError {
     fn from(e: opensearch::Error) -> Self {
@@ -1521,6 +1728,7 @@ impl IntoResponse for ApiError {
                 json!("If-Match precondition failed"),
             ),
             ApiError::PreconditionRequired(msg) => (StatusCode::PRECONDITION_REQUIRED, json!(msg)),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, json!(msg)),
             ApiError::WriteConflict(id) => (
                 StatusCode::CONFLICT,
                 json!(format!(
@@ -1537,6 +1745,39 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_item_format() {
+        let all = all_item_formats();
+        assert_eq!(item_format(None, &all).unwrap(), ItemFormat::GeoJson);
+        assert_eq!(
+            item_format(Some("geojson"), &all).unwrap(),
+            ItemFormat::GeoJson
+        );
+        assert_eq!(
+            item_format(Some("json"), &all).unwrap(),
+            ItemFormat::GeoJson
+        );
+        assert_eq!(
+            item_format(Some("ndjson"), &all).unwrap(),
+            ItemFormat::NdJson
+        );
+        assert_eq!(
+            item_format(Some("geojsonseq"), &all).unwrap(),
+            ItemFormat::NdJson
+        );
+        assert!(item_format(Some("xml"), &all).is_err());
+
+        // `STAC_ENABLED_FORMATS=geojson`: `?f=ndjson` is a known-but-
+        // disabled 400 — distinct from the unknown-format 400.
+        let geojson_only = [ItemFormat::GeoJson].into_iter().collect();
+        let err = item_format(Some("ndjson"), &geojson_only).unwrap_err();
+        assert!(err.to_string().contains("not enabled"));
+        assert_eq!(
+            item_format(None, &geojson_only).unwrap(),
+            ItemFormat::GeoJson
+        );
+    }
 
     fn children_links(rels: &[&str]) -> serde_json::Value {
         json!(rels

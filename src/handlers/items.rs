@@ -6,7 +6,7 @@ use crate::store::{item_sort_clauses, COLLECTIONS_INDEX, ITEMS_INDEX};
 use axum::{
     extract::{Path, Query, RawQuery, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use futures_util::StreamExt;
@@ -34,7 +34,7 @@ pub async fn list_collection_items(
     RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     if state
         .store
         .get_document(COLLECTIONS_INDEX, &collection_id)
@@ -44,7 +44,10 @@ pub async fn list_collection_items(
         return Err(ApiError::NotFound(collection_id));
     }
     let (mut collection, limit, next_vals, prev_vals) =
-        items_page(&state, std::slice::from_ref(&collection_id), &query, None).await?;
+        match items_page(&state, std::slice::from_ref(&collection_id), &query, None).await? {
+            ItemsPage::Stream(resp) => return Ok(resp),
+            ItemsPage::Page(collection, limit, next, prev) => (collection, limit, next, prev),
+        };
     collection.links.push(link_json(
         format!("{}/collections/{collection_id}/items", state.base_url),
         "self",
@@ -60,7 +63,7 @@ pub async fn list_collection_items(
         prev_vals.as_deref(),
         pagination_extra(raw.as_deref()).as_deref(),
     ));
-    Ok(geo_json(collection))
+    Ok(geo_json(collection).into_response())
 }
 
 /// GET /collections/{id}/items/{item_id} — global item read.
@@ -443,15 +446,19 @@ pub async fn list_scoped_items(
     RawQuery(raw): RawQuery,
     Query(query): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     require_scoped_collection(&state, &catalog_id, &collection_id).await?;
-    let (mut collection, limit, next_vals, prev_vals) = items_page(
+    let (mut collection, limit, next_vals, prev_vals) = match items_page(
         &state,
         std::slice::from_ref(&collection_id),
         &query,
         Some(&catalog_id),
     )
-    .await?;
+    .await?
+    {
+        ItemsPage::Stream(resp) => return Ok(resp),
+        ItemsPage::Page(collection, limit, next, prev) => (collection, limit, next, prev),
+    };
     collection.links.push(link_json(
         format!(
             "{}/catalogs/{catalog_id}/collections/{collection_id}/items",
@@ -470,31 +477,35 @@ pub async fn list_scoped_items(
         prev_vals.as_deref(),
         pagination_extra(raw.as_deref()).as_deref(),
     ));
-    Ok(geo_json(collection))
+    Ok(geo_json(collection).into_response())
 }
 
-/// Shared items-listing pipeline: `?limit=&token=` + the features-binding
-/// filters (`ids`/`query`/`filter`/`bbox`/`datetime`/`q`) -> paginated search.
-/// `scoped_catalog_id` selects scoped vs canonical item link paths.
-/// Returns the collection, the effective page size (default applied and
-/// max cap enforced — the `limit=` the page links must advertise), and
-/// the `next`/`prev` cursor values (the page endpoints' `search_after`
-/// keys) for the page links.
-async fn items_page(
-    state: &AppState,
-    collections: &[String],
-    query: &ListQuery,
-    scoped_catalog_id: Option<&str>,
-) -> Result<
-    (
+/// `items_page` outcome — a normal paginated FeatureCollection, or a
+/// ready-made streaming response for `?f=ndjson`.
+enum ItemsPage {
+    Stream(Response),
+    /// The collection, the effective page size (`limit=` the page
+    /// links must advertise), and the `next`/`prev` cursor values.
+    Page(
         RawItemCollection,
         u64,
         Option<Vec<serde_json::Value>>,
         Option<Vec<serde_json::Value>>,
     ),
-    ApiError,
-> {
+}
+
+/// Shared items-listing pipeline: `?limit=&token=` + the features-binding
+/// filters (`ids`/`query`/`filter`/`bbox`/`datetime`/`q`) -> paginated search.
+/// `scoped_catalog_id` selects scoped vs canonical item link paths.
+/// `?f=ndjson` short-circuits to an unpaginated item stream.
+async fn items_page(
+    state: &Arc<AppState>,
+    collections: &[String],
+    query: &ListQuery,
+    scoped_catalog_id: Option<&str>,
+) -> Result<ItemsPage, ApiError> {
     check_filter_crs(query.filter_crs.as_deref())?;
+    let format = item_format(query.f.as_deref(), &state.enabled_formats)?;
     let (limit, _) = list_window(
         query.limit,
         None,
@@ -606,6 +617,19 @@ async fn items_page(
             item_sort_clauses(&search.items.sortby).len(),
         )?);
     }
+    if format == ItemFormat::NdJson {
+        return Ok(ItemsPage::Stream(
+            ndjson_response(
+                state,
+                collections,
+                &search,
+                &extra_filters,
+                scoped_catalog_id,
+                cursor,
+            )
+            .await?,
+        ));
+    }
     let (items, matched, next_vals, prev_vals) = state
         .store
         .search_items(
@@ -633,7 +657,7 @@ async fn items_page(
         number_matched: Some(matched),
         number_returned: Some(returned),
     };
-    Ok((collection, limit, next_vals, prev_vals))
+    Ok(ItemsPage::Page(collection, limit, next_vals, prev_vals))
 }
 
 /// Page links for a paged items listing — GET hrefs carrying the

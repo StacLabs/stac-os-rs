@@ -221,6 +221,409 @@ async fn test_scoped_search_intersection() {
 }
 
 #[tokio::test]
+async fn test_search_ndjson() {
+    let Some(state) = test_state(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let app = build_app(state);
+    let cat = uniq("it-ndjson");
+    let col = uniq("it-ndjson-col");
+    let it = uniq("it-ndjson-item");
+
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    let (s, _) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(item(&it)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // `?f=ndjson` streams every hit as one JSON object per line —
+    // `application/x-ndjson`, no FeatureCollection envelope.
+    for uri in [
+        format!("/catalogs/{cat}/search?f=ndjson"),
+        format!("/catalogs/{cat}/search?f=geojsonseq"),
+        format!("/catalogs/{cat}/collections/{col}/items?f=ndjson"),
+        format!("/collections/{col}/items?f=ndjson"),
+    ] {
+        let (s, headers, bytes) = call_raw(&app, "GET", &uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/x-ndjson",
+            "{uri}"
+        );
+        let lines: Vec<Value> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{uri}");
+        assert_eq!(lines[0]["type"], "Feature");
+        assert_eq!(lines[0]["id"], it);
+        // Generated links are merged into each line's item.
+        assert!(
+            lines[0]["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["rel"] == "self"),
+            "{uri}"
+        );
+    }
+
+    // POST body `f` — body wins over the query param.
+    let (s, headers, bytes) = call_raw(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search?f=xml"),
+        Some(json!({"f": "ndjson"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "application/x-ndjson");
+    assert!(!bytes.is_empty());
+
+    // Unknown format is a 400; a non-string body `f` is too.
+    let (s, _) = call(&app, "GET", "/search?f=xml", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = call(&app, "POST", "/search", Some(json!({"f": 5}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_search_ndjson_export_cap() {
+    let Some((app, _state)) = test_app_flags(TestFlags {
+        max_export_items: Some(1),
+        ..Default::default()
+    })
+    .await
+    else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let cat = uniq("it-ndcap");
+    let col = uniq("it-ndcap-col");
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    for i in ["a", "b"] {
+        let (s, _) = call(
+            &app,
+            "POST",
+            &format!("/catalogs/{cat}/collections/{col}/items"),
+            Some(item(&uniq(&format!("it-ndcap-{i}")))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+    }
+
+    // 2 matches > cap of 1 → 413 up front (matched is known from the
+    // eager first page — no truncated stream).
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?f=ndjson"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body["detail"].as_str().unwrap().contains("2 items > 1"));
+
+    // The items listing enforces the same cap — 2 items > 1.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/collections/{col}/items?f=ndjson"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body["detail"].as_str().unwrap().contains("2 items > 1"));
+
+    // ...but the FeatureCollection path is unaffected by the cap.
+    let (s, body) = call(&app, "GET", &format!("/catalogs/{cat}/search"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"].as_u64().unwrap(), 2);
+
+    // Cap ≥ matched streams normally.
+    let Some((app2, _)) = test_app_flags(TestFlags {
+        max_export_items: Some(2),
+        ..Default::default()
+    })
+    .await
+    else {
+        return;
+    };
+    call(&app2, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app2,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    for i in ["a", "b"] {
+        call(
+            &app2,
+            "POST",
+            &format!("/catalogs/{cat}/collections/{col}/items"),
+            Some(item(&uniq(&format!("it-ndcap-{i}")))),
+        )
+        .await;
+    }
+    let (s, headers, bytes) = call_raw(
+        &app2,
+        "GET",
+        &format!("/catalogs/{cat}/search?f=ndjson"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "application/x-ndjson");
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.lines().count(), 2);
+}
+
+#[tokio::test]
+async fn test_search_ndjson_format_disabled() {
+    // `STAC_ENABLED_FORMATS=geojson`: `?f=ndjson` is a known-but-
+    // disabled 400 on every surface; FeatureCollection unaffected.
+    let Some((app, _)) = test_app_flags(TestFlags {
+        enabled_formats: Some(
+            [stac_os_rs::handlers::ItemFormat::GeoJson]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    })
+    .await
+    else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let cat = uniq("it-nddis");
+    let col = uniq("it-nddis-col");
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections/{col}/items"),
+        Some(item(&uniq("it-nddis-item"))),
+    )
+    .await;
+
+    for path in [
+        format!("/catalogs/{cat}/search?f=ndjson"),
+        format!("/catalogs/{cat}/collections/{col}/items?f=ndjson"),
+        format!("/catalogs/{cat}/collections/{col}/items?f=geojsonseq"),
+    ] {
+        let (s, body) = call(&app, "GET", &path, None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{path}");
+        assert!(body["detail"].as_str().unwrap().contains("not enabled"));
+    }
+    let (s, body) = call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/search"),
+        Some(json!({"f": "ndjson"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body["detail"].as_str().unwrap().contains("not enabled"));
+
+    let (s, body) = call(&app, "GET", &format!("/catalogs/{cat}/search"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"].as_u64().unwrap(), 1);
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?f=geojson"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_search_ndjson_empty_scope() {
+    // A root search naming only unknown collections still answers the
+    // negotiated format — an empty ndjson stream, not a FeatureCollection.
+    let Some(state) = test_state(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let app = build_app(state);
+    let cat = uniq("it-ndempty");
+    let col = uniq("it-ndempty-col");
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+
+    for (method, uri, body) in [
+        (
+            "GET",
+            "/search?f=ndjson&collections=bogus".to_string(),
+            None,
+        ),
+        (
+            "POST",
+            "/search".to_string(),
+            Some(json!({"collections": [], "f": "ndjson"})),
+        ),
+    ] {
+        let (s, headers, bytes) = call_raw(&app, method, &uri, body).await;
+        assert_eq!(s, StatusCode::OK, "{method} {uri}");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/x-ndjson",
+            "{method} {uri}"
+        );
+        assert!(bytes.is_empty(), "{method} {uri}");
+    }
+
+    // Same scope, FeatureCollection path — empty collection as before.
+    let (s, body) = call(&app, "GET", "/search?collections=bogus", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["numberMatched"], 0);
+
+    // The scope 403 precedes `f` validation, like every other
+    // extension param — not a `f`-is-invalid 400.
+    let (s, _) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?collections=bogus&f=xml"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_search_ndjson_token_resume() {
+    // `token` is a dump start position: `next`/`prev` tokens alike
+    // mark a sort position, and the stream yields everything after it.
+    let Some(state) = test_state(true).await else {
+        eprintln!("skipping: OpenSearch unreachable");
+        return;
+    };
+    let app = build_app(state);
+    let cat = uniq("it-ndresume");
+    let col = uniq("it-ndresume-col");
+    call(&app, "POST", "/catalogs", Some(catalog(&cat))).await;
+    call(
+        &app,
+        "POST",
+        &format!("/catalogs/{cat}/collections"),
+        Some(collection(&col)),
+    )
+    .await;
+    for i in ["a", "b"] {
+        let (s, _) = call(
+            &app,
+            "POST",
+            &format!("/catalogs/{cat}/collections/{col}/items"),
+            Some(item(&uniq(&format!("it-ndresume-{i}")))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+    }
+
+    let page_link_token = |link: &Value| -> String {
+        let href = link["href"].as_str().unwrap();
+        href.split("token=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    // Page 1 of 2 via `limit=1`; its `next` token resumes the dump at
+    // page 2 — exactly one item streams.
+    let (s, body) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let first_id = body["features"][0]["id"].as_str().unwrap().to_string();
+    let links = body["links"].as_array().unwrap();
+    let next_token = page_link_token(links.iter().find(|l| l["rel"] == "next").unwrap());
+
+    let (s, headers, bytes) = call_raw(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?f=ndjson&token={next_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "application/x-ndjson");
+    let lines: Vec<Value> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_ne!(lines[0]["id"].as_str().unwrap(), first_id);
+
+    // Page 2's `prev` token anchors on that page's first item — the
+    // result's last — so the dump streams the empty tail, not an
+    // out-of-order first page.
+    let (s, page2) = call(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?limit=1&token={next_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let links = page2["links"].as_array().unwrap();
+    let prev_token = page_link_token(links.iter().find(|l| l["rel"] == "prev").unwrap());
+    let (s, headers, bytes) = call_raw(
+        &app,
+        "GET",
+        &format!("/catalogs/{cat}/search?f=ndjson&token={prev_token}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "application/x-ndjson");
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
 async fn test_search_bbox_datetime_intersects_ids() {
     let Some(state) = test_state(true).await else {
         eprintln!("skipping: OpenSearch unreachable");

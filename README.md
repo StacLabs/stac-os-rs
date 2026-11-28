@@ -17,6 +17,8 @@ The following organizations have contributed time and/or funding to support the 
 
 ## Latest News
 
+- **11/22/2026:** 🚰 **`?f=ndjson` streaming item export** — every item-search and items-listing route now accepts `?f=ndjson` (alias `geojsonseq`) and returns the **entire result set** as newline-delimited STAC Items (`application/x-ndjson`), streamed straight from OpenSearch `_source` bytes in O(page) memory. Pipe a search URL into `jq`, `rustac`, `ogr2ogr`, or DuckDB's `read_json` — no pagination, no FeatureCollection envelope, no client-side page chasing. See [Item export formats](#item-export-formats-f).
+
 - **11/21/2026:** ⚡ **Raw `RawValue` read path lands** ([PR #31](https://github.com/StacLabs/stac-os-rs/pull/31)) — item reads (`/search`, `/catalogs/{id}/search`, and both items listings) now decode OpenSearch hits as `serde_json::value::RawValue` envelopes: `geometry`, `properties`, and `assets` are never DOM-parsed on the way out. Docs with no stored `links`, no `fields` filter, and no field exclusions get their generated `links` spliced in textually. Measured on the standard `stac-api-load-testing` workload (4 collections, 2,000 items, 8 locust workers): **~17% more requests/sec at every concurrency level** (2,268 vs 1,931 rps at 100 users) with p99 latency ~18% lower — and ~35% faster handler-side on heavy ~100 KB items. The same change fixed items listings silently *overwriting* `links` — discarding stored **user** links like `license` — they now merge exactly like `/search`.
 
 - **11/05/2026:** 🦀 **stac-os-rs — SFEOS in Rust!** Work has begun on [stac-os-rs](https://github.com/jonhealy1/stac-os-rs), a Rust implementation of this API. In early benchmarking with [stac-api-load-testing](https://github.com/StacLabs/stac-api-load-testing) it already serves roughly **2.2× the throughput of stac-fastapi-opensearch (sfeos) and ~8.7× stac-fastapi-pgstac** on the same dataset and workload — about 2,200 requests/sec vs ~1,000 at 50 concurrent users with zero failures — and its p99 latency is below stac-fastapi-opensearch's median. It's early days; follow the repo for progress. At ~8.7× the throughput of stac-fastapi-pgstac, the Rust + OpenSearch combination can serve the same workload on a fraction of the hardware — which is both an environmental and an economic argument for switching. It's also worth noting that sfeos itself was already ~4× faster than stac-fastapi-pgstac in these runs. 
@@ -35,6 +37,7 @@ The following organizations have contributed time and/or funding to support the 
 - [API Routes](#api-routes)
   - [Read surface — always mounted](#read-surface--always-mounted)
   - [Transactions](#transactions--require-enable_transactions_extensions)
+- [Item export formats (`?f=`)](#item-export-formats-f)
 - [Getting Started (coming from Python?)](#getting-started-coming-from-python)
   - [Configuration Reference](#configuration-reference)
 - [Extending (custom routes)](#extending-custom-routes)
@@ -76,7 +79,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/_mgmt/ping` | Health check — `{"message":"PONG"}` |
 | GET | `/sortables` | OGC Sortables schema for `sortby` discovery |
 | GET | `/queryables` | OGC Queryables JSON Schema — core item fields (`application/schema+json`) |
-| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `token` (`search_after` cursor; numeric = offset sugar), `fields`, `query`, `filter`, `q` (free text) → `next`/`prev` links |
+| GET/POST | `/search` | Registry-wide item search (same handler as `/catalogs/search`). Filters: `collections`, `ids`, `bbox`, `intersects`, `datetime`, `sortby`, `limit`, `token` (`search_after` cursor; numeric = offset sugar), `fields`, `query`, `filter`, `q` (free text) → `next`/`prev` links; `?f=ndjson` streams all matches |
 | GET | `/children` | Children extension — root-level catalogs + collections (`{children, links}`); `?type=Catalog\|Collection`, `?limit=&token=`, `filter` + `filter-lang`. Always mounted: collections-only when `ENABLE_CATALOGS_ROUTE` is off |
 | GET | `/collections` | `?limit=&token=` paging — every collection in the registry. Collections-search extensions: `sortby`, `fields`, `q` (free text), `filter` + `filter-lang`, `query`, `datetime`, `bbox` |
 | GET/POST | `/collections-search` | Requires `ENABLE_COLLECTIONS_SEARCH_ROUTE`. Same parameter surface as extended `/collections`; POST takes `{sortby:[{field,direction}], fields:{include,exclude}, q, filter, query, datetime, bbox, limit, token}` — `next` links carry `body.token` |
@@ -84,7 +87,7 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/collections/{collection_id}` | Canonical links (`self`, `parent` per parent, `duplicate`, `queryables`) |
 | GET | `/collections/{collection_id}/sortables` | Per-collection Sortables schema (`ogcapi-features-5` binding) |
 | GET | `/collections/{collection_id}/queryables` | Per-collection Queryables — core fields merged with the items index mapping; `platform.enum` populated from indexed values |
-| GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `?q=` free text (`FREE_TEXT_FIELDS`); `filter`, `query`, `bbox`, `datetime`, `ids`; `application/geo+json`, item `self`/`parent`/`collection`/`root` links |
+| GET | `/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `?q=` free text (`FREE_TEXT_FIELDS`); `filter`, `query`, `bbox`, `datetime`, `ids`; `application/geo+json`, item `self`/`parent`/`collection`/`root` links; `?f=ndjson` streams all matches |
 | GET | `/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
 
 **Multi-tenant catalogs routes** — mounted only while `ENABLE_CATALOGS_ROUTE` is on (the default)
@@ -99,10 +102,10 @@ When unset, only the read surface is mounted and the landing page `conformsTo` o
 | GET | `/catalogs/{catalog_id}/children` | `?type=Catalog\|Collection` filter, `?limit=&token=` paging; `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/collections` | `?limit=&token=` paging; `?sortby=±field` (mapping-driven sortables), `?fields=±field` projection, `?q=` free text, `filter` + `filter-lang` |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}` | Contextual `self`/`parent`, alt parents as `related`/`duplicate` |
-| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `?q=` free text (`FREE_TEXT_FIELDS`); `filter`, `query`, `bbox`, `datetime`, `ids`; `application/geo+json`, scoped item links |
+| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | `?limit=&token=` paging; `?sortby=±field`; `?fields=` filtering; `?q=` free text (`FREE_TEXT_FIELDS`); `filter`, `query`, `bbox`, `datetime`, `ids`; `application/geo+json`, scoped item links; `?f=ndjson` streams all matches |
 | GET | `/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}` | `application/geo+json` |
-| GET/POST | `/catalogs/search` | Whole-registry scope. Same filters as `/search` |
-| GET/POST | `/catalogs/{catalog_id}/search` | Same filters, intersected with the catalog's descendant collections |
+| GET/POST | `/catalogs/search` | Whole-registry scope. Same filters as `/search`; `?f=ndjson` streams all matches |
+| GET/POST | `/catalogs/{catalog_id}/search` | Same filters, intersected with the catalog's descendant collections; `?f=ndjson` streams all matches |
 
 GET search takes `collections`, `ids`, `bbox`, `datetime`, `intersects` (URL-encoded GeoJSON), `limit`, `token`, `sortby` (`+field`/`-field` shorthand), `fields` (comma-separated, `-` prefix excludes), `q` (comma-separated free-text terms, OR'd), `query` (JSON-encoded STACQL), `filter` + `filter-lang` (`cql2-text`/`cql2-json`), and `filter-crs` as query params; POST takes the full `Search` body (`intersects`, `fields: {include, exclude}`, `query`, `filter` + `filter-lang` — defaults to `cql2-json`). A bbox crossing the antimeridian (`xmin > xmax`) is supported — internally rewritten as a ±180°-split `MultiPolygon` intersects query.
 
@@ -149,6 +152,53 @@ Scoped reads 404 when the target collection isn't inside the catalog's DAG. Item
 Status codes: `201` create (Mode A), `200` link (Mode B `{"id": ...}`) / update, `204` delete/unlink, `400` bad request (`limit=0`, id mismatch, invalid search), `404` missing resource or edge, `409` id collision / full-body repost, `412` failed `If-Match` precondition.
 
 **Optimistic concurrency (ETag/`If-Match`):** single-resource GET and write responses carry a strong `ETag` (`"<primary_term>-<seq_no>-<indexhash>"`, suffixed `-gzip`/`-br` when the body is compressed — RFC 9110 §8.8.1). `PUT`/`PATCH`/`DELETE` honor `If-Match` (`*`, tag lists, weak/malformed tags never match); the checked version conditions the write itself, so check-and-write is atomic (`409`→`412` on a lost race).
+
+## Item export formats (`?f=`)
+
+Item endpoints accept the OGC Features `?f=` output-format parameter. `?f=geojson` (or `json`, or omitting `f`) is the standard paginated `FeatureCollection` response; `?f=ndjson` (alias `geojsonseq`) switches to a **streaming export** of the entire result set as newline-delimited JSON (`application/x-ndjson`) — one complete STAC Item per line.
+
+**Supported routes**
+
+| Method | Path | `?f=ndjson` behavior |
+|---|---|---|
+| GET/POST | `/search` | Streams all registry-wide matches |
+| GET/POST | `/catalogs/search` | Same (root scope) |
+| GET/POST | `/catalogs/{catalog_id}/search` | Streams all in-scope matches |
+| GET | `/collections/{collection_id}/items` | Streams all items in the collection (respecting `filter`/`query`/`bbox`/`datetime`/`ids`/`q`/`sortby`) |
+| GET | `/catalogs/{catalog_id}/collections/{collection_id}/items` | Same, with scoped links |
+
+**Why use it**
+
+- **Unpaginated** — `limit`/`token` paging is bypassed: the response is every match, end to end. (A `token` is still honored as a *start* position if you want to resume a dump.)
+- **Lossless** — each line is the full item: nested `assets`, `links`, `stac_extensions`, and arbitrary `properties.*` stay intact. Generated `links` (`self`, `parent`, `collection`, `root`) are merged in exactly like the FeatureCollection response, so exported items round-trip into other STAC tooling.
+- **Constant memory, server-side** — items stream straight from OpenSearch `_source` bytes without a JSON DOM build (the same `RawValue` read path that made reads faster), and pages chain on `search_after` cursors, so memory stays O(page size) whether the dump is 10 items or 10 million.
+- **Constant memory, client-side** — line-delimited output is stream-parseable: no multi-gigabyte FeatureCollection to buffer.
+
+**Examples**
+
+```bash
+# Pipe a filtered search into jq — one complete Item per line
+curl -s 'http://localhost:3000/search?collections=landsat&f=ndjson' | jq -c '{id, cc: .properties["eo:cloud_cover"]}'
+
+# Dump a whole collection to a file
+curl -s 'http://localhost:3000/collections/landsat/items?f=ndjson' > items.ndjson
+
+# Load into DuckDB / rustac / GDAL
+duckdb -c "SELECT id, collection FROM read_json('items.ndjson', format='newline_delimited')"
+rustac translate items.ndjson items.parquet
+ogr2ogr -f FlatGeobuf items.fgb items.ndjson
+
+# POST search bodies take "f" too (body wins over the ?f= query param)
+curl -s -X POST http://localhost:3000/search \
+  -H 'content-type: application/json' \
+  -d '{"f": "ndjson", "filter": {"op": ">", "args": [{"property": "properties.eo:cloud_cover"}, 90]}}'
+```
+
+`f` accepts `geojson`/`json`/`ndjson`/`geojsonseq` — anything else (or a non-string `f` in a POST body) is a `400`. `fields` filters and `EXCLUDED_FROM_ITEMS` exclusions apply to the streamed items the same way they do to the FeatureCollection response.
+
+**Formats can be disabled** — `STAC_ENABLED_FORMATS=geojson` turns off the NDJSON export entirely: `?f=ndjson` (and `geojsonseq`) then get a `400` saying the format isn't enabled, while FeatureCollection responses are untouched. Useful when an operator wants exports off rather than just bounded. `geojson` itself can't be disabled — it's the wire format.
+
+**Export ceiling** — a full-catalog dump means sequential `search_after` fetches against OpenSearch plus a long-lived response; several concurrent unbounded exports add real load. Set [`STAC_MAX_EXPORT_ITEMS`](#configuration-reference) to cap the result set a single `?f=ndjson` request may stream: when `numberMatched` exceeds it the request fails fast with `413` (the matched count is known from the first page, so the cap costs nothing and never yields a truncated stream). Unset = unlimited. The cap only applies to `?f=ndjson` — normal paginated FeatureCollection responses are unaffected.
 
 ## Getting Started (coming from Python?)
 
@@ -219,6 +269,8 @@ All variables are read once at startup — changing them requires a restart.
 | `STAC_GLOBAL_COLLECTION_MAX_LIMIT` | Hard cap on collection page size — larger `limit` values clamp to this. | none | Optional |
 | `STAC_DEFAULT_ITEM_LIMIT` | Default page size for item listings and `/search` when `limit` isn't given. | `10` | Optional |
 | `STAC_GLOBAL_ITEM_MAX_LIMIT` | Hard cap on item page size — larger `limit` values clamp to this. | none | Optional |
+| `STAC_MAX_EXPORT_ITEMS` | Max items a single `?f=ndjson` export may stream — larger result sets fail fast with `413` (see [Item export formats](#item-export-formats-f)). | none (unlimited) | Optional |
+| `STAC_ENABLED_FORMATS` | Comma-separated `?f=` allowlist (`geojson`, `ndjson`). A disabled format gets a `400`; `geojson` can't be removed — it's the wire format. Unknown names fail startup. | all formats | Optional |
 
 **Filtering & Exclusions**
 
